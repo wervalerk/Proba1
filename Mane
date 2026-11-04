@@ -309,7 +309,7 @@ async def button_make_pdf(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     dxf_path = Path(dxf_path_str)
-    if not dzf_path.exists():
+    if not dxf_path.exists():
         await query.edit_message_caption(caption="Файл не найден на сервере.")
         return
 
