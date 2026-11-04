@@ -19,7 +19,7 @@ from ezdxf import units
 from ezdxf.addons.drawing import matplotlib as drawing_matplotlib
 
 # ================== НАСТРОЙКИ ==================
-BOT_TOKEN = "ВАШ_ТОКЕН_ОТ_BOTFATHER"
+BOT_TOKEN = "9000882141:AAFIX8GonkZMJhrMCRgAtyJAT-GDCsR0P8c"
 WORK_DIR = Path("bot_work")
 WORK_DIR.mkdir(exist_ok=True)
 # ==============================================
