@@ -73,7 +73,6 @@ def parse_points_from_txt(text: str) -> list[tuple[int, float, float, float]]:
 
         nums = []
         for p in parts:
-            # Поддержка запятой как десятичного разделителя
             if "," in p and "." not in p:
                 p = p.replace(",", ".")
             try:
@@ -116,8 +115,10 @@ def add_points_to_dxf(dxf_path: Path, points: list) -> int:
     if "TEXT" not in doc.layers:
         doc.layers.add("TEXT", color=3)            # зелёный
 
-    # Размер креста (увеличьте при необходимости)
-    CROSS_SIZE = 12.0
+    # === РАЗМЕРЫ (под ваш масштаб) ===
+    CROSS_SIZE = 2.0          # размер креста
+    TEXT_HEIGHT = 1.8         # высота номера
+    TEXT_OFFSET = 1.2         # отступ текста от креста
 
     # Создаём блок с крестом и атрибутом ID
     if "POINT_WITH_ID" not in doc.blocks:
@@ -128,27 +129,20 @@ def add_points_to_dxf(dxf_path: Path, points: list) -> int:
                        dxfattribs={"layer": "POINTS", "color": 1})
         block.add_line((0, -CROSS_SIZE/2), (0, CROSS_SIZE/2),
                        dxfattribs={"layer": "POINTS", "color": 1})
-        block.add_point((0, 0), dxfattribs={"layer": "POINTS"})
+        
+        # Маленькая точка в центре
+        block.add_circle((0, 0), radius=0.15, dxfattribs={"layer": "POINTS", "color": 1})
 
         # Атрибут номера
         block.add_attdef(
             tag="ID",
-            insert=(CROSS_SIZE/2 + 2, CROSS_SIZE/2 + 1),
+            insert=(TEXT_OFFSET, TEXT_OFFSET),
             dxfattribs={
                 "layer": "TEXT",
-                "height": 8.0,
+                "height": TEXT_HEIGHT,
                 "style": "Standard",
             }
         )
-
-    # Автоматический размер текста в зависимости от размаха точек
-    if points:
-        xs = [p[1] for p in points]
-        ys = [p[2] for p in points]
-        span = max(max(xs) - min(xs), max(ys) - min(ys), 1.0)
-        text_height = max(span / 120.0, 5.0)
-    else:
-        text_height = 8.0
 
     for point_id, x, y, z in points:
         ref = msp.add_blockref(
@@ -157,9 +151,6 @@ def add_points_to_dxf(dxf_path: Path, points: list) -> int:
             dxfattribs={"layer": "POINTS"}
         )
         ref.add_auto_attribs({"ID": str(point_id)})
-
-        if "ID" in ref.attribs:
-            ref.attribs["ID"].dxf.height = text_height
 
         if z != 0.0:
             ref.dxf.insert = (x, y, z)
