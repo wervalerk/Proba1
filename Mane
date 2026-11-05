@@ -1,10 +1,15 @@
 import os
 import re
 import logging
-import traceback  # Добавлено для вывода полной ошибки
+import traceback
 from pathlib import Path
 
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import (
+    Update, 
+    InlineKeyboardButton, 
+    InlineKeyboardMarkup,
+    InputFile
+)
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -19,6 +24,7 @@ from ezdxf import units
 from ezdxf.addons.drawing import matplotlib as drawing_matplotlib
 
 # ================== НАСТРОЙКИ ==================
+# ВАЖНО: Замените строку ниже на ваш реальный токен от @BotFather
 BOT_TOKEN = "9000882141:AAFIX8GonkZMJhrMCRgAtyJAT-GDCsR0P8c"
 WORK_DIR = Path("bot_work")
 WORK_DIR.mkdir(exist_ok=True)
@@ -35,12 +41,14 @@ WAITING_PDF_CHOICE = 2
 
 
 def get_user_dxf_files(user_id: int) -> list[Path]:
+    """Возвращает список DXF-файлов пользователя, отсортированных по дате (новые сверху)."""
     prefix = f"user_{user_id}_"
     files = [f for f in WORK_DIR.glob(f"{prefix}*.dxf")]
     return sorted(files, key=lambda x: x.stat().st_mtime, reverse=True)
 
 
 def get_display_name(path: Path, user_id: int) -> str:
+    """Возвращает имя файла без префикса пользователя."""
     prefix = f"user_{user_id}_"
     name = path.name
     if name.startswith(prefix):
@@ -48,28 +56,71 @@ def get_display_name(path: Path, user_id: int) -> str:
     return name
 
 
-def parse_points_from_txt(text: str) -> list[tuple[float, float, float]]:
+def parse_points_from_txt(text: str) -> list[tuple[int, float, float, float]]:
+    """
+    Умный парсер. 
+    Возвращает список кортежей: (номер_из_файла, x, y, z).
+    Если номера в файле нет, он будет сгенерирован как порядковый.
+    Поддерживает разделители: пробел, таб, запятая, точка с запятой.
+    Поддерживает десятичную запятую: 100,5 -> 100.5
+    """
     points = []
-    for line in text.splitlines():
+    lines = text.splitlines()
+    
+    for line in lines:
         line = line.strip()
         if not line or line.startswith("#"):
             continue
-        parts = re.split(r"[,\s]+", line)
+            
+        # Разбиваем по любому количеству пробелов, запятых или точек с запятой
+        parts = re.split(r"[,\s;]+", line)
         parts = [p for p in parts if p]
         if len(parts) < 2:
             continue
-        try:
-            x = float(parts[0])
-            y = float(parts[1])
-            z = float(parts[2]) if len(parts) >= 3 else 0.0
-            points.append((x, y, z))
-        except ValueError:
+
+        nums = []
+        for p in parts:
+            # Если это десятичная запятая без точки (формат 100,5)
+            if "," in p and "." not in p:
+                p = p.replace(",", ".")
+            
+            try:
+                nums.append(float(p))
+            except ValueError:
+                # Если токен не число (например, "Т.1" или "P1"), просто пропускаем его
+                continue
+
+        if len(nums) < 2:
             continue
-    return points
+
+        # Логика определения ID:
+        # Если чисел >= 3, и первое число целое (например, 1.0, 25.0), считаем его ID
+        if len(nums) >= 3 and nums[0].is_integer():
+            point_id = int(nums[0])
+            x, y, z = nums[1], nums[2], nums[3] if len(nums) > 3 else 0.0
+        else:
+            # Если формат X Y или X Y Z, ID будет назначен по порядку позже
+            point_id = -1 
+            x, y, z = nums[0], nums[1], nums[2] if len(nums) > 2 else 0.0
+            
+        points.append((point_id, x, y, z))
+
+    # Присваиваем порядковые номера тем точкам, у которых не было ID в файле
+    final_points = []
+    current_id = 1
+    for pid, x, y, z in points:
+        if pid == -1:
+            final_points.append((current_id, x, y, z))
+            current_id += 1
+        else:
+            final_points.append((pid, x, y, z))
+            
+    return final_points
 
 
 def add_points_to_dxf(dxf_path: Path, points: list) -> int:
     """
+    Добавляет точки в DXF.
     points: список кортежей вида (номер_точки, x, y, z)
     """
     if dxf_path.exists():
@@ -117,6 +168,7 @@ def add_points_to_dxf(dxf_path: Path, points: list) -> int:
 
 
 def dxf_to_pdf(dxf_path: Path, pdf_path: Path) -> bool:
+    """Конвертирует DXF в PDF через встроенный рендерер ezdxf."""
     try:
         doc = ezdxf.readfile(dxf_path)
         drawing_matplotlib.qsave(doc.modelspace(), str(pdf_path), dpi=150)
@@ -127,16 +179,10 @@ def dxf_to_pdf(dxf_path: Path, pdf_path: Path) -> bool:
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # ПУНКТ 4: Отладочный принт
-    print("Функция /start вызвана!")
-    
     await update.message.reply_text(
-        "Пришлите .txt файл с координатами точек.\n\n"
-        "Формат:\n"
-        "x y\n"
-        "или x y z\n"
-        "или x,y,z\n\n"
-        "Точкам будут присвоены порядковые номера из файла.\n\n"
+        "Привет! Я добавляю точки из TXT в ваши DXF-файлы.\n\n"
+        "1. Пришлите .txt файл с координатами (x y или x y z).\n"
+        "2. Напишите имя нового файла (например: site.dxf) или пришлите существующий .dxf.\n\n"
         "Команды:\n"
         "/list — список ваших DXF-файлов\n"
         "/pdf — сделать PDF из любого файла\n"
@@ -145,9 +191,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def list_files(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # ПУНКТ 4: Отладочный принт
-    print("Функция /list вызвана!")
-    
     user_id = update.effective_user.id
     files = get_user_dxf_files(user_id)
 
@@ -165,9 +208,6 @@ async def list_files(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def handle_txt(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # ПУНКТ 4: Отладочный принт
-    print("Функция handle_txt (получен TXT) вызвана!")
-    
     document = update.message.document
     if not document or not (document.file_name or "").lower().endswith(".txt"):
         await update.message.reply_text("Нужен файл с расширением .txt")
@@ -190,21 +230,19 @@ async def handle_txt(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Не нашёл ни одной валидной точки.")
         return ConversationHandler.END
 
-    # Добавляем порядковые номера (начиная с 1)
-    points_with_ids = [(i + 1, x, y, z) for i, (x, y, z) in enumerate(raw_points)]
-    context.user_data["points"] = points_with_ids
+    context.user_data["points"] = raw_points
 
     user_id = update.effective_user.id
     files = get_user_dxf_files(user_id)
 
-    msg = f"Найдено точек: {len(points_with_ids)}\n\n"
+    msg = f"Найдено точек: {len(raw_points)}\n\n"
 
     if files:
         msg += "Ваши DXF-файлы:\n"
         for i, f in enumerate(files, 1):
             name = get_display_name(f, user_id)
             msg += f"{i}. {name}\n"
-        msg += "\nОтветьте номером, напишите имя или пришлите DXF-файл.\n"
+        msg += "\nОтветьте номером, напишите имя нового файла или пришлите DXF-файл.\n"
     else:
         msg += "У вас пока нет DXF-файлов.\n"
         msg += "Напишите имя нового файла (например: scheme.dxf)\n"
@@ -216,9 +254,6 @@ async def handle_txt(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def handle_dxf_or_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # ПУНКТ 4: Отладочный принт
-    print("Функция handle_dxf_or_name вызвана!")
-    
     points = context.user_data.get("points")
     if not points:
         await update.message.reply_text("Сначала отправьте TXT с точками.")
@@ -271,11 +306,8 @@ async def handle_dxf_or_name(update: Update, context: ContextTypes.DEFAULT_TYPE)
         return ConversationHandler.END
 
     display_name = get_display_name(dxf_path, user_id)
-
-    # Сохраняем путь для кнопки
     context.user_data["last_dxf"] = str(dxf_path)
 
-    # Кнопка "Сделать PDF"
     keyboard = InlineKeyboardMarkup(
         [[InlineKeyboardButton("📄 Сделать PDF", callback_data="make_pdf")]]
     )
@@ -299,7 +331,6 @@ async def handle_dxf_or_name(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 
 async def button_make_pdf(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обработка нажатия кнопки «Сделать PDF»."""
     query = update.callback_query
     await query.answer()
 
@@ -334,9 +365,6 @@ async def button_make_pdf(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def pdf_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Команда /pdf — выбрать файл из списка."""
-    # ПУНКТ 4: Отладочный принт
-    print("Функция /pdf вызвана!")
-    
     user_id = update.effective_user.id
     files = get_user_dxf_files(user_id)
 
@@ -344,7 +372,6 @@ async def pdf_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("У вас нет DXF-файлов.")
         return ConversationHandler.END
 
-    # Делаем кнопки для каждого файла
     buttons = []
     for i, f in enumerate(files):
         name = get_display_name(f, user_id)
@@ -352,7 +379,7 @@ async def pdf_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     keyboard = InlineKeyboardMarkup(buttons)
     await update.message.reply_text("Выберите файл для PDF:", reply_markup=keyboard)
-    return ConversationHandler.END
+    return WAITING_PDF_CHOICE
 
 
 async def button_pdf_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -403,11 +430,10 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 def main():
-    # ПУНКТ 4: Глобальная проверка ошибок запуска
     try:
-        # Проверка токена перед запуском
-        if BOT_TOKEN == "ВАШ_ТОКЕН_ОТ_BOTFATHER" or not BOT_TOKEN.strip():
+        if BOT_TOKEN == "9000882141:AAFIX8GonkZMJhrMCRgAtyJAT-GDCsR0P8c" or not BOT_TOKEN.strip():
             print("ОШИБКА: Вы не указали токен бота в переменной BOT_TOKEN!")
+            print("Замените строку BOT_TOKEN = \"...\" на ваш реальный токен.")
             return
 
         print("Инициализация бота...")
@@ -433,7 +459,6 @@ def main():
         app.add_handler(CommandHandler("cancel", cancel))
         app.add_handler(conv_handler)
 
-        # Обработчики кнопок
         app.add_handler(CallbackQueryHandler(button_make_pdf, pattern="^make_pdf$"))
         app.add_handler(CallbackQueryHandler(button_pdf_choice, pattern="^pdf_"))
 
@@ -441,7 +466,6 @@ def main():
         app.run_polling(allowed_updates=Update.ALL_TYPES)
 
     except Exception as e:
-        # Если бот упал, выведем полную ошибку в консоль
         print("=" * 50)
         print("КРИТИЧЕСКАЯ ОШИБКА: Бот упал с исключением:")
         print(str(e))
