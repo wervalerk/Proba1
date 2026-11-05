@@ -117,8 +117,8 @@ def add_points_to_dxf(dxf_path: Path, points: list) -> int:
 
     # === РАЗМЕРЫ (под ваш масштаб) ===
     CROSS_SIZE = 0.1          # размер креста
-    TEXT_HEIGHT = 0.05         # высота номера
-    TEXT_OFFSET = 0.05         # отступ текста от креста
+    TEXT_HEIGHT = 0.2         # высота номера
+    TEXT_OFFSET = 0.1         # отступ текста от креста
 
     # Создаём блок с крестом и атрибутом ID
     if "POINT_WITH_ID" not in doc.blocks:
