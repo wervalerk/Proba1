@@ -25,7 +25,6 @@ from ezdxf.addons.drawing import matplotlib as drawing_matplotlib
 
 # ================== НАСТРОЙКИ ==================
 # ВНИМАНИЕ: Замените плейсхолдер на ВАШ реальный токен от @BotFather
-# Не забудьте знак РАВНО (=) после BOT_TOKEN
 BOT_TOKEN = "9000882141:AAFEtOR78VeKCCuHfrE68LNNbc2rZU8Z-Dc"
 WORK_DIR = Path("bot_work")
 WORK_DIR.mkdir(exist_ok=True)
@@ -73,7 +72,6 @@ def parse_points_from_txt(text: str):
         if not line or line.startswith("#"):
             continue
             
-        # Разбиваем по любому количеству пробелов, запятых или точек с запятой
         parts = re.split(r"[,\s;]+", line)
         parts = [p for p in parts if p]
         if len(parts) < 2:
@@ -81,32 +79,26 @@ def parse_points_from_txt(text: str):
 
         nums = []
         for p in parts:
-            # Если это десятичная запятая без точки (формат 100,5)
             if "," in p and "." not in p:
                 p = p.replace(",", ".")
             
             try:
                 nums.append(float(p))
             except ValueError:
-                # Если токен не число (например, "Т.1" или "P1"), просто пропускаем его
                 continue
 
         if len(nums) < 2:
             continue
 
-        # Логика определения ID:
-        # Если чисел >= 3, и первое число целое (например, 1.0, 25.0), считаем его ID
         if len(nums) >= 3 and nums[0].is_integer():
             point_id = int(nums[0])
             x, y, z = nums[1], nums[2], nums[3] if len(nums) > 3 else 0.0
         else:
-            # Если формат X Y или X Y Z, ID будет назначен по порядку позже
             point_id = -1 
             x, y, z = nums[0], nums[1], nums[2] if len(nums) > 2 else 0.0
             
         points.append((point_id, x, y, z))
 
-    # Присваиваем порядковые номера тем точкам, у которых не было ID в файле
     final_points = []
     current_id = 1
     for pid, x, y, z in points:
@@ -121,8 +113,8 @@ def parse_points_from_txt(text: str):
 
 def add_points_to_dxf(dxf_path: Path, points: list) -> int:
     """
-    Добавляет точки в DXF.
-    points: список кортежей вида (номер_точки, x, y, z)
+    Добавляет точки в DXF в виде блоков.
+    Каждый блок содержит: круг (видимый маркер 0.5мм), точку и текстовый ID.
     """
     if dxf_path.exists():
         doc = ezdxf.readfile(dxf_path)
@@ -135,41 +127,67 @@ def add_points_to_dxf(dxf_path: Path, points: list) -> int:
     if "POINTS" not in doc.layers:
         doc.layers.add("POINTS", color=1)
 
-    # Создаем блок с атрибутом ID, если его еще нет в файле
+    # Создаем блок с видимым маркером (кругом), если его еще нет
     if "POINT_WITH_ID" not in doc.blocks:
         point_block = doc.blocks.new(name="POINT_WITH_ID")
-        # Геометрия точки
+        
+        # 1. Видимый маркер: Окружность радиусом 0.25 (диаметр 0.5 мм)
+        point_block.add_circle(
+            center=(0, 0), 
+            radius=0.25, 
+            dxfattribs={"layer": "POINTS", "color": 1}
+        )
+        
+        # 2. Сама точка (геометрический центр)
         point_block.add_point((0, 0), dxfattribs={"layer": "POINTS"})
-        # Текстовый атрибут для номера
+        
+        # 3. Текстовый атрибут для номера
         point_block.add_attdef(
             tag="ID",
-            insert=(0.15, 0.15),  # Смещение текста относительно точки
+            insert=(0.4, 0.4),  # Смещение текста относительно центра
             dxfattribs={
                 "layer": "POINTS",
-                "height": 2.5,  # Высота шрифта номера
+                "height": 2.5,
                 "style": "Standard",
             },
         )
 
-    # Добавляем точки
+    # Вычисляем размах для динамической высоты текста (минимум 2.0)
+    xs = [p[1] for p in points]
+    ys = [p[2] for p in points]
+    if xs and ys:
+        span = max(max(xs) - min(xs), max(ys) - min(ys), 1.0)
+        text_height = max(span / 200.0, 2.0)
+    else:
+        text_height = 2.5
+
+    # Добавляем точки на чертеж
     for point_data in points:
         point_id = point_data[0]
         x, y, z = point_data[1], point_data[2], point_data[3]
 
+        # Вставляем блок в координаты точки
         block_ref = msp.add_blockref(
             "POINT_WITH_ID",
             (x, y),
             dxfattribs={"layer": "POINTS"},
         )
-        # Присваиваем конкретному блоку его номер
+        
+        # Присваиваем номер
         block_ref.add_auto_attribs({"ID": str(point_id)})
+        
+        # Обновляем высоту текста под масштаб чертежа
+        block_ref.attribs["ID"].dxf.height = text_height
+
+        # Если есть координата Z, добавляем её в DXF
+        if z != 0.0:
+            block_ref.dxf.z = z
 
     doc.saveas(dxf_path)
     return len(points)
 
 
 def dxf_to_pdf(dxf_path: Path, pdf_path: Path) -> bool:
-    """Конвертирует DXF в PDF через встроенный рендерер ezdxf."""
     try:
         doc = ezdxf.readfile(dxf_path)
         drawing_matplotlib.qsave(doc.modelspace(), str(pdf_path), dpi=150)
@@ -287,6 +305,7 @@ async def handle_dxf_or_name(update: Update, context: ContextTypes.DEFAULT_TYPE)
                 await update.message.reply_text("Неверный номер. Попробуйте ещё раз.")
                 return WAITING_DXF
         else:
+            # Автоматически добавляем расширение .dxf, если его нет
             name = text
             if not name.lower().endswith(".dxf"):
                 name += ".dxf"
@@ -301,7 +320,7 @@ async def handle_dxf_or_name(update: Update, context: ContextTypes.DEFAULT_TYPE)
     try:
         added = add_points_to_dxf(dxf_path, points)
         doc = ezdxf.readfile(dxf_path)
-        total = len(list(doc.modelspace().query("POINT")))
+        total = len(list(doc.modelspace().query("INSERT"))) # Считаем блоки
     except Exception as e:
         await update.message.reply_text(f"Ошибка: {e}")
         return ConversationHandler.END
@@ -365,7 +384,6 @@ async def button_make_pdf(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def pdf_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Команда /pdf — выбрать файл из списка."""
     user_id = update.effective_user.id
     files = get_user_dxf_files(user_id)
 
@@ -384,7 +402,6 @@ async def pdf_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def button_pdf_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обработка выбора файла из /pdf."""
     query = update.callback_query
     await query.answer()
 
@@ -432,7 +449,6 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 def main():
     try:
-        # Проверка на плейсхолдер
         if BOT_TOKEN == "ВАШ_ТОКЕН_ЗДЕСЬ_БЕЗ_КАВЫЧЕК" or not BOT_TOKEN.strip():
             print("ОШИБКА: Вы не указали токен бота в переменной BOT_TOKEN!")
             print("Замените строку BOT_TOKEN = \"...\" на ваш реальный токен от @BotFather.")
