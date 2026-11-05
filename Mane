@@ -26,7 +26,7 @@ from ezdxf.addons.drawing import matplotlib as drawing_matplotlib
 # ================== НАСТРОЙКИ ==================
 # ВНИМАНИЕ: Замените плейсхолдер на ВАШ реальный токен от @BotFather
 # Не забудьте знак РАВНО (=) после BOT_TOKEN
-BOT_TOKEN = "ВАШ_ТОКЕН_ЗДЕСЬ_БЕЗ_КАВЫЧЕК"
+BOT_TOKEN = "9000882141:AAFEtOR78VeKCCuHfrE68LNNbc2rZU8Z-Dc"
 WORK_DIR = Path("bot_work")
 WORK_DIR.mkdir(exist_ok=True)
 # ==============================================
