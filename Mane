@@ -51,10 +51,10 @@ def get_display_name(path: Path, user_id: int) -> str:
 def parse_points_from_txt(text: str) -> list[tuple[int, float, float, float]]:
     """
     Поддерживает форматы:
-    1 100.5 200.3 15.0
-    1,100.5,200.3,15.0
-    1 100,5 200,3 15,0
-    100.5 200.3
+    0,9515.3269,2864.9039,168.6069
+    18,9517.0772,2868.5569,170.1437
+    18 9517.0772 2868.5569 170.1437
+    9515.3269,2864.9039,168.6069
     100,5 200,3 15,0
     """
     points = []
@@ -65,7 +65,6 @@ def parse_points_from_txt(text: str) -> list[tuple[int, float, float, float]]:
         if not line or line.startswith("#"):
             continue
 
-        # Разделяем по пробелам, запятым и точкам с запятой
         parts = re.split(r"[,;\s]+", line)
         parts = [p.strip() for p in parts if p.strip()]
 
@@ -74,7 +73,7 @@ def parse_points_from_txt(text: str) -> list[tuple[int, float, float, float]]:
 
         nums = []
         for p in parts:
-            # Заменяем запятую на точку, если это десятичный разделитель
+            # Поддержка запятой как десятичного разделителя
             if "," in p and "." not in p:
                 p = p.replace(",", ".")
             try:
@@ -85,8 +84,8 @@ def parse_points_from_txt(text: str) -> list[tuple[int, float, float, float]]:
         if len(nums) < 2:
             continue
 
-        # Определяем, есть ли номер точки
-        if len(nums) >= 3 and nums[0].is_integer() and nums[0] > 0:
+        # Если первое число — целое (включая 0), считаем его номером точки
+        if len(nums) >= 3 and nums[0].is_integer():
             point_id = int(nums[0])
             x = nums[1]
             y = nums[2]
@@ -113,27 +112,31 @@ def add_points_to_dxf(dxf_path: Path, points: list) -> int:
     msp = doc.modelspace()
 
     if "POINTS" not in doc.layers:
-        doc.layers.add("POINTS", color=1)
+        doc.layers.add("POINTS", color=1)          # красный
     if "TEXT" not in doc.layers:
-        doc.layers.add("TEXT", color=5)
+        doc.layers.add("TEXT", color=3)            # зелёный
+
+    # Размер креста (увеличьте при необходимости)
+    CROSS_SIZE = 12.0
 
     # Создаём блок с крестом и атрибутом ID
     if "POINT_WITH_ID" not in doc.blocks:
         block = doc.blocks.new(name="POINT_WITH_ID")
-        size = 0.8
 
         # Крест
-        block.add_line((-size/2, 0), (size/2, 0), dxfattribs={"layer": "POINTS", "color": 1})
-        block.add_line((0, -size/2), (0, size/2), dxfattribs={"layer": "POINTS", "color": 1})
+        block.add_line((-CROSS_SIZE/2, 0), (CROSS_SIZE/2, 0),
+                       dxfattribs={"layer": "POINTS", "color": 1})
+        block.add_line((0, -CROSS_SIZE/2), (0, CROSS_SIZE/2),
+                       dxfattribs={"layer": "POINTS", "color": 1})
         block.add_point((0, 0), dxfattribs={"layer": "POINTS"})
 
         # Атрибут номера
         block.add_attdef(
             tag="ID",
-            insert=(size/2 + 0.4, size/2 + 0.3),
+            insert=(CROSS_SIZE/2 + 2, CROSS_SIZE/2 + 1),
             dxfattribs={
                 "layer": "TEXT",
-                "height": 2.5,
+                "height": 8.0,
                 "style": "Standard",
             }
         )
@@ -143,9 +146,9 @@ def add_points_to_dxf(dxf_path: Path, points: list) -> int:
         xs = [p[1] for p in points]
         ys = [p[2] for p in points]
         span = max(max(xs) - min(xs), max(ys) - min(ys), 1.0)
-        text_height = max(span / 180.0, 1.8)
+        text_height = max(span / 120.0, 5.0)
     else:
-        text_height = 2.5
+        text_height = 8.0
 
     for point_id, x, y, z in points:
         ref = msp.add_blockref(
@@ -155,7 +158,6 @@ def add_points_to_dxf(dxf_path: Path, points: list) -> int:
         )
         ref.add_auto_attribs({"ID": str(point_id)})
 
-        # Меняем высоту текста
         if "ID" in ref.attribs:
             ref.attribs["ID"].dxf.height = text_height
 
@@ -184,8 +186,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "1. Пришлите .txt файл с точками\n"
         "2. Напишите имя файла или пришлите готовый .dxf\n\n"
         "Поддерживаемые форматы:\n"
-        "<code>1 100.5 200.3 15.0</code>\n"
-        "<code>1,100.5,200.3,15.0</code>\n"
+        "<code>0,9515.3269,2864.9039,168.6069</code>\n"
+        "<code>18 9517.0772 2868.5569 170.1437</code>\n"
         "<code>100,5 200,3 15,0</code>\n\n"
         "Команды:\n"
         "/view — посмотреть последний TXT\n"
@@ -493,7 +495,7 @@ def main():
     app.add_handler(CommandHandler("cancel", cancel))
     app.add_handler(conv_handler)
 
-    # Важно: регистрируем обработчики кнопок
+    # Обработчики кнопок
     app.add_handler(CallbackQueryHandler(button_make_pdf, pattern="^make_pdf$"))
     app.add_handler(CallbackQueryHandler(button_pdf_choice, pattern="^pdf_"))
 
