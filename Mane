@@ -24,6 +24,7 @@ from ezdxf import units
 from ezdxf.addons.drawing import matplotlib as drawing_matplotlib
 
 # ================== НАСТРОЙКИ ==================
+# ВНИМАНИЕ: Замените плейсхолдер на ВАШ реальный токен от @BotFather
 BOT_TOKEN = "9000882141:AAFEtOR78VeKCCuHfrE68LNNbc2rZU8Z-Dc"
 WORK_DIR = Path("bot_work")
 WORK_DIR.mkdir(exist_ok=True)
@@ -91,3 +92,26 @@ def parse_points_from_txt(text: str):
             final_points.append((current_id, x, y, z))
             current_id += 1
         else:
+            final_points.append((pid, x, y, z))
+    return final_points
+
+
+def add_points_to_dxf(dxf_path: Path, points: list) -> int:
+    if dxf_path.exists():
+        doc = ezdxf.readfile(dxf_path)
+    else:
+        doc = ezdxf.new(dxfversion="R2010")
+        doc.units = units.M
+
+    msp = doc.modelspace()
+    if "POINTS" not in doc.layers:
+        doc.layers.add("POINTS", color=1)
+    if "TEXT" not in doc.layers:
+        doc.layers.add("TEXT", color=5)
+
+    if "POINT_WITH_ID" not in doc.blocks:
+        point_block = doc.blocks.new(name="POINT_WITH_ID")
+        size = 0.5
+        # Видимый маркер-крест
+        point_block.add_line(start=(-size/2, 0), end=(size/2, 0), dxfattribs={"layer": "POINTS", "color": 1})
+        point_block.add_line(start=(0, -size/2), end=(0, size/2), dxfattribs={"layer":
