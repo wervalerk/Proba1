@@ -1,71 +1,230 @@
+#!/usr/bin/env python3
+"""
+Telegram-бот: точки из TXT → DXF.
+- После TXT сразу размеры и превью (без раннего запроса DXF).
+- Позже можно добавить DXF как подложку (геометрия проекта).
+- Модуль 0: проверка системы координат (медиана до контура, X↔Y, X0 Y0).
+"""
+
+from __future__ import annotations
+
 import os
 import re
+import math
 import logging
+import statistics
+import tempfile
+import shutil
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
+from typing import List, Optional, Tuple, Dict, Any
 
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto
 from telegram.ext import (
     Application, CommandHandler, MessageHandler, CallbackQueryHandler,
     ConversationHandler, ContextTypes, filters,
 )
 import ezdxf
-from ezdxf import units
+from ezdxf import units, bbox
+from ezdxf.path import make_path
 from ezdxf.addons.drawing import matplotlib as drawing_matplotlib
-import matplotlib.pyplot as plt
 import matplotlib
-matplotlib.use('Agg')
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 
 # ================== НАСТРОЙКИ ==================
-BOT_TOKEN = "9000882141:AAFEtOR78VeKCCuHfrE68LNNbc2rZU8Z-Dc"          # ← ВСТАВЬТЕ СВОЙ ТОКЕН
-WORK_DIR = Path("bot_work")
-WORK_DIR.mkdir(exist_ok=True)
+BOT_TOKEN = "9000882141:AAFEtOR78VeKCCuHfrE68LNNbc2rZU8Z-Dc"  # ← ваш токен
+WORK_DIR = Path("bot_work").resolve()
+WORK_DIR.mkdir(parents=True, exist_ok=True)
+
+# Пороги проверки СК (из первого бота)
+NEAR_M = 5.0          # «рядом»: медиана до ближайшего контура, м
+SWAP_RATIO = 3.0      # во сколько раз X↔Y должна улучшить, чтобы предложить
+SHIFT_M = 50.0        # выше этого → просим X0 Y0
 # ==============================================
 
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    level=logging.INFO,
+)
 logger = logging.getLogger(__name__)
 
-# Состояния
-WAITING_CONFIRM = 1
-WAITING_DXF_CHOICE = 2
-WAITING_SIZES = 3
-WAITING_PREVIEW = 4
+# Состояния ConversationHandler
+(
+    WAITING_CONFIRM,
+    WAITING_SIZES,
+    WAITING_CUSTOM_SIZE,
+    WAITING_PREVIEW,
+    WAITING_UNDERLAY,      # ждём DXF-подложку
+    WAITING_CS,            # проверка СК / кнопки
+    WAITING_SHIFT,         # ввод X0 Y0
+) = range(7)
 
 
-def get_user_dxf_files(user_id: int):
-    prefix = f"user_{user_id}_"
-    files = list(WORK_DIR.glob(f"{prefix}*.dxf"))
-    return sorted(files, key=lambda x: x.stat().st_mtime, reverse=True)
+# ═══════════════════════════════════════════════════════════════
+#  МОДУЛЬ 0 — проверка системы координат (портировано)
+# ═══════════════════════════════════════════════════════════════
+
+@dataclass
+class Seg:
+    ax: float
+    ay: float
+    az: float
+    bx: float
+    by: float
+    bz: float
+    layer: str = "0"
 
 
-def get_display_name(path: Path, user_id: int) -> str:
-    prefix = f"user_{user_id}_"
-    name = path.name
-    return name[len(prefix):] if name.startswith(prefix) else name
+@dataclass
+class CSReport:
+    direct: float
+    swapped: float
+    c_txt: Tuple[float, float]
+    c_txt_sw: Tuple[float, float]
+    c_dxf: Tuple[float, float]
+    ok: bool
+    suggest_swap: bool
+    need_shift: bool
+
+    @property
+    def best(self) -> float:
+        return min(self.direct, self.swapped)
 
 
-def parse_points_from_txt(text: str):
+def _seg_xy_dist(px: float, py: float, s: Seg) -> float:
+    ax, ay, bx, by = s.ax, s.ay, s.bx, s.by
+    vx, vy = bx - ax, by - ay
+    L2 = vx * vx + vy * vy
+    if L2 < 1e-18:
+        return math.hypot(px - ax, py - ay)
+    t = ((px - ax) * vx + (py - ay) * vy) / L2
+    t = 0.0 if t < 0.0 else (1.0 if t > 1.0 else t)
+    return math.hypot(px - (ax + t * vx), py - (ay + t * vy))
+
+
+def _median_nearest(points: List[Tuple[float, float]], segments: List[Seg]) -> float:
+    if not points or not segments:
+        return float("inf")
+    return statistics.median(
+        min(_seg_xy_dist(x, y, s) for s in segments) for x, y in points
+    )
+
+
+def _centroid_xy(points: List[Tuple[float, float]]) -> Tuple[float, float]:
+    if not points:
+        return (0.0, 0.0)
+    return (
+        sum(p[0] for p in points) / len(points),
+        sum(p[1] for p in points) / len(points),
+    )
+
+
+def check_cs(
+    txt_points: List[Tuple[Any, float, float, float]],
+    dxf_segments: List[Seg],
+    shift: Tuple[float, float] = (0.0, 0.0),
+) -> CSReport:
+    """A: TXT как есть vs DXF+shift; B: TXT с X↔Y vs DXF+shift."""
+    direct_pts = [(x, y) for _, x, y, _ in txt_points]
+    swap_pts = [(y, x) for _, x, y, _ in txt_points]
+    dxf_pts = []
+    for s in dxf_segments:
+        dxf_pts += [(s.ax, s.ay), (s.bx, s.by)]
+    d0 = _median_nearest(direct_pts, dxf_segments)
+    d1 = _median_nearest(swap_pts, dxf_segments)
+    ok = d0 <= NEAR_M
+    suggest = (not ok) and (d1 < d0) and (d1 <= NEAR_M or d1 * SWAP_RATIO <= d0)
+    return CSReport(
+        d0, d1,
+        _centroid_xy(direct_pts),
+        _centroid_xy(swap_pts),
+        _centroid_xy(dxf_pts),
+        ok, suggest,
+        (not ok) and (not suggest),
+    )
+
+
+def cs_text(rep: CSReport, shift: Tuple[float, float] = (0.0, 0.0), swapped: bool = False) -> str:
+    sx, sy = shift
+    gain = rep.direct / max(rep.swapped, 1e-6)
+    orient = "🔄 X↔Y уже применена" if swapped else "X→X, Y→Y (исходная)"
+    lines = [
+        "🔎 *Модуль 0 · проверка СК*:",
+        f"Текущая ориентация TXT: *{orient}*.",
+        f"• как сейчас: медиана до контура *{rep.direct:,.1f} м*",
+        f"• если инвертировать `X↔Y`: *{rep.swapped:,.1f} м*",
+        f"Центры: TXT `{rep.c_txt[0]:,.1f}; {rep.c_txt[1]:,.1f}` → "
+        f"инверсия `{rep.c_txt_sw[0]:,.1f}; {rep.c_txt_sw[1]:,.1f}` ↔ "
+        f"DXF `{rep.c_dxf[0]:,.1f}; {rep.c_dxf[1]:,.1f}` "
+        f"(SHIFT `{sx:,.3f}; {sy:,.3f}`).",
+    ]
+    if rep.ok:
+        lines.append(f"✅ СК рядом (порог {NEAR_M:.0f} м) — можно создавать файл.")
+    elif rep.suggest_swap:
+        lines.append(
+            f"⚠️ Похоже, оси переставлены: инверсия лучше в *{gain:.0f}×*.\n"
+            "*🔄 Поменять X↔Y* переключит столбцы `X`/`Y` только в TXT "
+            "(`H` и `SHIFT` не трогаю) и сразу перепроверит.\n"
+            "🔁 *Перепроверить СК* — без перезаливки файлов."
+        )
+    else:
+        lines.append(
+            f"⚠️ Не рядом (оба ≫ {NEAR_M:.0f} м). Нужен `X0 Y0` — "
+            "привязка нуля DXF в осях DXF. Авто-центрирование не делаю.\n"
+            "✏️ *Ввести X0 Y0* (или просто два числа), "
+            "🔁 *Перепроверить*, *Оставить как есть* — с предупреждением."
+        )
+    return "\n".join(lines)
+
+
+def cs_kb(swapped: bool = False) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton(
+                "↩️ Вернуть X/Y" if swapped else "🔄 Поменять X↔Y",
+                callback_data="cs_swap",
+            ),
+            InlineKeyboardButton("Оставить как есть", callback_data="cs_keep"),
+        ],
+        [
+            InlineKeyboardButton("✏️ Ввести X0 Y0", callback_data="cs_shift"),
+            InlineKeyboardButton("🔁 Перепроверить СК", callback_data="cs_recheck"),
+        ],
+    ])
+
+
+# ═══════════════════════════════════════════════════════════════
+#  Парсинг TXT и DXF-геометрии
+# ═══════════════════════════════════════════════════════════════
+
+def parse_points_from_txt(text: str) -> List[Tuple[int, float, float, float]]:
     points = []
     auto_id = 1
     for line in text.splitlines():
         line = line.strip()
         if not line or line.startswith("#"):
             continue
-        parts = re.split(r"[,;\s]+", line)
+        s = line.replace(";", " ").replace("\t", " ")
+        if re.search(r"\s", s):
+            s = re.sub(r"(?<=\d),(?=\d)", ".", s)
+            s = s.replace(",", " ")
+            parts = s.split()
+        else:
+            parts = s.split(",")
         parts = [p.strip() for p in parts if p.strip()]
         if len(parts) < 2:
             continue
         nums = []
         for p in parts:
-            if "," in p and "." not in p:
-                p = p.replace(",", ".")
             try:
-                nums.append(float(p))
+                nums.append(float(p.replace(",", ".")))
             except ValueError:
                 continue
         if len(nums) < 2:
             continue
-        if len(nums) >= 3 and nums[0].is_integer():
+        if len(nums) >= 3 and float(nums[0]).is_integer() and abs(nums[0]) < 1e6:
             point_id = int(nums[0])
             x, y = nums[1], nums[2]
             z = nums[3] if len(nums) > 3 else 0.0
@@ -78,56 +237,237 @@ def parse_points_from_txt(text: str):
     return points
 
 
-def calculate_auto_sizes(points):
+SUPPORTED = {"LWPOLYLINE", "POLYLINE", "LINE", "ARC"}
+
+
+def walk(entities, depth=0):
+    for e in entities:
+        if e.dxftype() == "INSERT" and depth < 3:
+            try:
+                yield from walk(e.virtual_entities(), depth + 1)
+            except Exception:
+                continue
+        else:
+            yield e
+
+
+def manual_pts(e):
+    t = e.dxftype()
+    if t == "LWPOLYLINE":
+        z = float(e.dxf.get("elevation", 0.0) or 0.0)
+        return [(p[0], p[1], z) for p in e.get_points("xy")], bool(getattr(e, "closed", False))
+    if t == "POLYLINE":
+        return [
+            (v.dxf.location.x, v.dxf.location.y, v.dxf.location.z)
+            for v in e.vertices
+        ], bool(getattr(e, "is_closed", False))
+    if t == "LINE":
+        s, e2 = e.dxf.start, e.dxf.end
+        return [(s.x, s.y, s.z), (e2.x, e2.y, e2.z)], False
+    if t == "ARC":
+        c, r = e.dxf.center, e.dxf.radius
+        a0, a1 = e.dxf.start_angle, e.dxf.end_angle
+        if a1 < a0:
+            a1 += 360.0
+        n = max(16, int((a1 - a0) / 5) + 1)
+        return [
+            (
+                c.x + r * math.cos(math.radians(a0 + (a1 - a0) * i / (n - 1))),
+                c.y + r * math.sin(math.radians(a0 + (a1 - a0) * i / (n - 1))),
+                c.z,
+            )
+            for i in range(n)
+        ], False
+    return [], False
+
+
+def raw_path(e):
+    if e.dxftype() not in SUPPORTED:
+        return None
+    try:
+        ext = bbox.extents([e])
+        local = max(
+            abs(ext.extmin.x), abs(ext.extmin.y),
+            abs(ext.extmax.x), abs(ext.extmax.y),
+        )
+    except Exception:
+        local = 1000.0
+    flat = max(local * 2e-4, 1e-3)
+    try:
+        p = make_path(e)
+        pts = [(v.x, v.y, v.z) for v in p.flattening(flat)]
+        closed = bool(getattr(p, "is_closed", False))
+    except Exception:
+        pts, closed = manual_pts(e)
+    closed = (
+        closed
+        or bool(getattr(e, "closed", False))
+        or bool(getattr(e, "is_closed", False))
+    )
+    if len(pts) < 2:
+        return None
+    if closed and math.hypot(pts[-1][0] - pts[0][0], pts[-1][1] - pts[0][1]) > 1e-9:
+        pts.append(pts[0])
+    return {"pts": pts, "closed": closed, "layer": e.dxf.layer}
+
+
+def choose_scale(doc, maxabs: float, override: Optional[str] = None):
+    if override:
+        return {"m": 1.0, "cm": 0.01, "mm": 0.001}[override], f"DXFUNITS={override}"
+    u = int(doc.header.get("$INSUNITS", 0) or 0)
+    tbl = {1: 0.0254, 2: 0.3048, 4: 0.001, 5: 0.01, 6: 1.0, 7: 1000.0, 10: 0.9144}
+    if u in tbl:
+        return tbl[u], f"$INSUNITS={u}"
+    if maxabs > 1000.0:
+        return 0.001, "$INSUNITS=0 → мм"
+    return 1.0, "$INSUNITS=0 → м"
+
+
+@dataclass
+class DxfGeom:
+    polylines: List[Tuple[List[Tuple[float, float, float]], bool, str]]
+    segments: List[Seg]
+    scale_note: str
+    has_z: bool
+
+
+def parse_dxf_geom(
+    path: Path,
+    shift: Tuple[float, float] = (0.0, 0.0),
+    dxfunits_override: Optional[str] = None,
+) -> DxfGeom:
+    doc = ezdxf.readfile(str(path))
+    raw = [r for r in (raw_path(e) for e in walk(doc.modelspace())) if r]
+    if not raw:
+        raise ValueError("Не найдено LWPOLYLINE / POLYLINE / LINE / ARC (в т.ч. в блоках).")
+    coords = [v for r in raw for p in r["pts"] for v in (p[0], p[1])]
+    scale, note = choose_scale(doc, max(abs(v) for v in coords), dxfunits_override)
+    dx, dy = shift
+    polylines, segments = [], []
+    contour_z = []
+    for r in raw:
+        pts_m = [(x * scale + dx, y * scale + dy, z * scale) for x, y, z in r["pts"]]
+        contour_z.append(sum(p[2] for p in pts_m) / len(pts_m))
+        polylines.append((pts_m, r["closed"], r["layer"]))
+        for a, b in zip(pts_m, pts_m[1:]):
+            if (b[0] - a[0]) ** 2 + (b[1] - a[1]) ** 2 < 1e-18:
+                continue
+            segments.append(Seg(*a, *b, r["layer"]))
+    if not segments:
+        raise ValueError("После приведения единиц не осталось отрезков.")
+    distinct = {round(z, 3) for z in contour_z}
+    has_z = len(distinct) > 1 or any(abs(z) > 1e-9 for z in contour_z)
+    return DxfGeom(polylines, segments, note, has_z)
+
+
+# ═══════════════════════════════════════════════════════════════
+#  Размеры, превью, запись DXF
+# ═══════════════════════════════════════════════════════════════
+
+def calculate_auto_sizes(points: List[Tuple]) -> Tuple[float, float]:
     if len(points) < 2:
         return 0.7, 0.9
-    min_dist = float('inf')
+    min_dist = float("inf")
     for i in range(len(points)):
         for j in range(i + 1, len(points)):
             dx = points[i][1] - points[j][1]
             dy = points[i][2] - points[j][2]
-            dist = (dx*dx + dy*dy) ** 0.5
+            dist = math.hypot(dx, dy)
             if 0.01 < dist < min_dist:
                 min_dist = dist
-    if min_dist == float('inf'):
+    if min_dist == float("inf"):
         min_dist = 2.0
     cross = max(min(min_dist * 0.28, 2.0), 0.35)
     text = max(min(min_dist * 0.38, 2.5), 0.5)
     return round(cross, 2), round(text, 2)
 
 
-def create_preview_image(points, cross_size, text_height, out_path: Path):
-    fig, ax = plt.subplots(figsize=(10, 8), dpi=120)
+def create_preview_image(
+    points: List[Tuple],
+    cross_size: float,
+    text_height: float,
+    out_path: Path,
+    underlay: Optional[DxfGeom] = None,
+    title_extra: str = "",
+):
+    fig, ax = plt.subplots(figsize=(11, 8.5), dpi=130)
+
+    if underlay:
+        for pts, closed, _ in underlay.polylines:
+            xs = [p[0] for p in pts]
+            ys = [p[1] for p in pts]
+            if closed and len(pts) >= 3:
+                ax.fill(xs, ys, facecolor="#eaf5df", edgecolor="none", zorder=0, alpha=0.7)
+            ax.plot(xs, ys, color="#7d7d7d", lw=0.7, zorder=1)
+
     xs = [p[1] for p in points]
     ys = [p[2] for p in points]
     ids = [str(p[0]) for p in points]
 
-    ax.scatter(xs, ys, c='red', s=22, zorder=3)
-    for x, y, pid in zip(xs, ys, ids):
-        ax.text(x + text_height*0.55, y + text_height*0.55, pid,
-                fontsize=max(text_height * 7.5, 5.5), color='lime', zorder=4)
+    half = cross_size / 2
+    for x, y in zip(xs, ys):
+        ax.plot([x - half, x + half], [y, y], color="red", lw=1.1, zorder=3)
+        ax.plot([x, x], [y - half, y + half], color="red", lw=1.1, zorder=3)
+        ax.plot(x, y, "o", color="red", markersize=3, zorder=4)
 
-    ax.set_aspect('equal', adjustable='datalim')
-    ax.grid(True, linestyle='--', alpha=0.35)
-    ax.set_title(f"Превью   |   Крест: {cross_size}    Текст: {text_height}", fontsize=12)
-    ax.margins(0.07)
+    for x, y, pid in zip(xs, ys, ids):
+        ax.text(
+            x + text_height * 0.55,
+            y + text_height * 0.55,
+            pid,
+            fontsize=max(text_height * 7.0, 5.0),
+            color="#1a7a1a",
+            zorder=5,
+            fontweight="bold",
+        )
+
+    ax.set_aspect("equal", adjustable="datalim")
+    ax.grid(True, linestyle="--", alpha=0.3)
+    title = f"Превью  |  Крест: {cross_size}   Текст: {text_height}"
+    if title_extra:
+        title += f"  |  {title_extra}"
+    ax.set_title(title, fontsize=11)
+    ax.margins(0.06)
     fig.tight_layout()
-    fig.savefig(out_path, dpi=120, bbox_inches='tight')
+    fig.savefig(out_path, dpi=130, bbox_inches="tight", facecolor="white")
     plt.close(fig)
 
 
-def add_points_to_dxf(dxf_path: Path, points, cross_size=0.7, text_height=0.9) -> int:
-    if dxf_path.exists():
-        doc = ezdxf.readfile(dxf_path)
-    else:
-        doc = ezdxf.new(dxfversion="R2010")
-        doc.units = units.M
+def add_points_and_underlay_to_dxf(
+    dxf_path: Path,
+    points: List[Tuple],
+    cross_size: float = 0.7,
+    text_height: float = 0.9,
+    underlay: Optional[DxfGeom] = None,
+) -> int:
+    doc = ezdxf.new(dxfversion="R2010")
+    doc.units = units.M
+    doc.header["$INSUNITS"] = 6
+    doc.header["$MEASUREMENT"] = 1
 
     msp = doc.modelspace()
-    if "POINTS" not in doc.layers:
-        doc.layers.add("POINTS", color=1)
-    if "TEXT" not in doc.layers:
-        doc.layers.add("TEXT", color=3)
+
+    for name, color in (("PROJ", 8), ("HATCH", 3), ("POINTS", 1), ("TEXT", 3)):
+        if name not in doc.layers:
+            doc.layers.add(name, color=color)
+
+    if underlay:
+        for pts, closed, _ in underlay.polylines:
+            xy = [(p[0], p[1]) for p in pts]
+            if closed and len(xy) > 2 and math.hypot(xy[-1][0] - xy[0][0], xy[-1][1] - xy[0][1]) < 1e-9:
+                xy = xy[:-1]
+            msp.add_lwpolyline(
+                xy,
+                close=closed,
+                dxfattribs={"layer": "PROJ", "color": 8},
+            )
+            if closed and len(xy) >= 3:
+                try:
+                    h = msp.add_hatch(dxfattribs={"layer": "HATCH", "color": 3})
+                    h.set_pattern_fill("ANSI31", scale=max(cross_size * 0.4, 0.02), color=3)
+                    h.paths.add_polyline_path(xy, is_closed=True)
+                except Exception:
+                    pass
 
     block_name = "POINT_WITH_ID"
     if block_name in doc.blocks:
@@ -135,69 +475,128 @@ def add_points_to_dxf(dxf_path: Path, points, cross_size=0.7, text_height=0.9) -
 
     block = doc.blocks.new(name=block_name)
     TEXT_OFFSET = text_height * 0.65
-    CIRCLE_R = max(cross_size * 0.13, 0.05)
+    CIRCLE_R = max(cross_size * 0.13, 0.04)
 
-    block.add_line((-cross_size/2, 0), (cross_size/2, 0), dxfattribs={"layer": "POINTS", "color": 1})
-    block.add_line((0, -cross_size/2), (0, cross_size/2), dxfattribs={"layer": "POINTS", "color": 1})
-    block.add_circle((0, 0), radius=CIRCLE_R, dxfattribs={"layer": "POINTS", "color": 1})
-    block.add_attdef(tag="ID", insert=(TEXT_OFFSET, TEXT_OFFSET),
-                     dxfattribs={"layer": "TEXT", "height": text_height, "style": "Standard"})
+    block.add_line(
+        (-cross_size / 2, 0), (cross_size / 2, 0),
+        dxfattribs={"layer": "POINTS", "color": 1},
+    )
+    block.add_line(
+        (0, -cross_size / 2), (0, cross_size / 2),
+        dxfattribs={"layer": "POINTS", "color": 1},
+    )
+    block.add_circle(
+        (0, 0), radius=CIRCLE_R,
+        dxfattribs={"layer": "POINTS", "color": 1},
+    )
+    block.add_attdef(
+        tag="ID",
+        insert=(TEXT_OFFSET, TEXT_OFFSET),
+        dxfattribs={"layer": "TEXT", "height": text_height, "style": "Standard", "color": 3},
+    )
 
     for pid, x, y, z in points:
         ref = msp.add_blockref(block_name, (x, y), dxfattribs={"layer": "POINTS"})
         ref.add_auto_attribs({"ID": str(pid)})
-        if z != 0.0:
+        if abs(z) > 1e-9:
             ref.dxf.insert = (x, y, z)
 
-    doc.saveas(dxf_path)
+    doc.saveas(str(dxf_path))
     return len(points)
 
 
 def dxf_to_pdf(dxf_path: Path, pdf_path: Path) -> bool:
     try:
-        doc = ezdxf.readfile(dxf_path)
-        drawing_matplotlib.qsave(doc.modelspace(), str(pdf_path), dpi=140)
+        doc = ezdxf.readfile(str(dxf_path))
+        drawing_matplotlib.qsave(doc.modelspace(), str(pdf_path), dpi=150)
         return True
     except Exception as e:
-        logger.error(e)
+        logger.error("PDF error: %s", e)
         return False
 
 
-# ================== ХЕНДЛЕРЫ ==================
+# ═══════════════════════════════════════════════════════════════
+#  Хелперы путей и клавиатур
+# ═══════════════════════════════════════════════════════════════
+
+def user_tmp(user_id: int) -> Path:
+    p = WORK_DIR / f"user_{user_id}"
+    p.mkdir(parents=True, exist_ok=True)
+    return p
+
+
+def sizes_keyboard(auto_c: float, auto_t: float) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(f"🤖 Авто ({auto_c} / {auto_t})", callback_data="size_auto")],
+        [
+            InlineKeyboardButton("0.4 / 0.6", callback_data="size_0.4_0.6"),
+            InlineKeyboardButton("0.6 / 0.8", callback_data="size_0.6_0.8"),
+        ],
+        [
+            InlineKeyboardButton("0.8 / 1.0", callback_data="size_0.8_1.0"),
+            InlineKeyboardButton("1.2 / 1.5", callback_data="size_1.2_1.5"),
+        ],
+        [InlineKeyboardButton("✏️ Ввести свои значения", callback_data="size_custom")],
+    ])
+
+
+def preview_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("✅ Создать DXF (без подложки)", callback_data="create_plain")],
+        [InlineKeyboardButton("📂 Добавить DXF как подложку", callback_data="add_underlay")],
+        [InlineKeyboardButton("🔄 Изменить размеры", callback_data="change_sizes")],
+    ])
+
+
+# ═══════════════════════════════════════════════════════════════
+#  ХЕНДЛЕРЫ
+# ═══════════════════════════════════════════════════════════════
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data.clear()
     await update.message.reply_text(
-        "Привет! Бот для добавления точек из TXT в DXF.\n\n"
-        "1. Пришлите .txt файл\n"
-        "2. Подтвердите данные\n"
-        "3. Выберите: новый файл или загрузить существующий DXF\n"
-        "4. Настройте размер креста и текста (есть кнопка Авто)\n"
-        "5. Посмотрите превью → создайте файл\n\n"
-        "/list — ваши DXF\n/pdf — сделать PDF\n/cancel — отмена"
+        "Привет! Бот добавляет точки из TXT в DXF.\n\n"
+        "1. Пришлите `.txt` файл с точками\n"
+        "2. Подтвердите → выберите размер креста/текста\n"
+        "3. Посмотрите превью\n"
+        "4. Создайте DXF *или* добавьте DXF как *подложку*\n"
+        "   (при подложке работает проверка системы координат)\n\n"
+        "/list — ваши DXF\n/cancel — отмена"
     )
 
 
 async def list_files(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
-    files = get_user_dxf_files(user_id)
+    files = sorted(
+        (WORK_DIR / f"user_{user_id}").glob("*.dxf") if (WORK_DIR / f"user_{user_id}").exists() else [],
+        key=lambda x: x.stat().st_mtime,
+        reverse=True,
+    )
     if not files:
         await update.message.reply_text("Пока нет DXF-файлов.")
         return
     text = "Ваши DXF-файлы:\n\n"
-    for i, f in enumerate(files, 1):
-        text += f"{i}. {get_display_name(f, user_id)}\n"
-    await update.message.reply_text(text)
+    for i, f in enumerate(files[:20], 1):
+        text += f"{i}. `{f.name}`\n"
+    await update.message.reply_text(text, parse_mode="Markdown")
+
+
+async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data.clear()
+    await update.message.reply_text("Отменено. /start")
+    return ConversationHandler.END
 
 
 async def handle_txt(update: Update, context: ContextTypes.DEFAULT_TYPE):
     document = update.message.document
     if not document or not (document.file_name or "").lower().endswith(".txt"):
-        await update.message.reply_text("Нужен файл .txt")
+        await update.message.reply_text("Нужен файл `.txt`")
         return ConversationHandler.END
 
-    await update.message.reply_text("Читаю файл...")
+    await update.message.reply_text("Читаю файл…")
     file = await context.bot.get_file(document.file_id)
-    txt_path = WORK_DIR / f"user_{update.effective_user.id}_points.txt"
+    tmp = user_tmp(update.effective_user.id)
+    txt_path = tmp / "points.txt"
     await file.download_to_drive(txt_path)
 
     text = txt_path.read_text(encoding="utf-8", errors="ignore")
@@ -206,19 +605,24 @@ async def handle_txt(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Не найдено ни одной точки.")
         return ConversationHandler.END
 
+    context.user_data.clear()
     context.user_data["points"] = points
+    context.user_data["swap_xy"] = False
+    context.user_data["shift"] = (0.0, 0.0)
+    context.user_data["_uid"] = update.effective_user.id
 
-    preview = text.strip()[-700:]
-    if len(text) > 700:
-        preview = "...\n" + preview
+    preview = text.strip()[-600:]
+    if len(text) > 600:
+        preview = "…\n" + preview
 
     keyboard = InlineKeyboardMarkup([
         [InlineKeyboardButton("✅ Продолжить", callback_data="confirm_yes")],
         [InlineKeyboardButton("❌ Отмена", callback_data="confirm_no")],
     ])
     await update.message.reply_text(
-        f"Найдено точек: <b>{len(points)}</b>\n\n<pre>{preview}</pre>",
-        reply_markup=keyboard, parse_mode="HTML"
+        f"Найдено точек: *{len(points)}*\n\n```\n{preview}\n```",
+        reply_markup=keyboard,
+        parse_mode="Markdown",
     )
     return WAITING_CONFIRM
 
@@ -231,129 +635,13 @@ async def handle_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text("Отменено.")
         return ConversationHandler.END
 
-    # Предлагаем имя файла
-    suggested = f"points_{datetime.now().strftime('%Y%m%d_%H%M')}.dxf"
-
-    keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton(f"✅ Продолжить с именем «{suggested}»", callback_data=f"newfile_{suggested}")],
-        [InlineKeyboardButton("📂 Загрузить существующий DXF", callback_data="upload_dxf")],
-        [InlineKeyboardButton("✏️ Ввести своё имя", callback_data="custom_name")],
-    ])
-
-    await query.edit_message_text(
-        f"Куда добавить точки?\n\n"
-        f"Рекомендуемое имя: <b>{suggested}</b>",
-        reply_markup=keyboard,
-        parse_mode="HTML"
-    )
-    return WAITING_DXF_CHOICE
-
-
-async def handle_dxf_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    data = query.data
-    user_id = update.effective_user.id
-
-    if data.startswith("newfile_"):
-        name = data.replace("newfile_", "")
-        dxf_path = WORK_DIR / f"user_{user_id}_{name}"
-        context.user_data["dxf_path"] = str(dxf_path)
-        await ask_sizes(query, context)
-        return WAITING_SIZES
-
-    if data == "upload_dxf":
-        await query.edit_message_text("Пришлите существующий DXF-файл:")
-        context.user_data["waiting_upload"] = True
-        return WAITING_DXF_CHOICE
-
-    if data == "custom_name":
-        await query.edit_message_text("Напишите имя файла (например: scheme.dxf):")
-        context.user_data["waiting_custom_name"] = True
-        return WAITING_DXF_CHOICE
-
-
-async def handle_dxf_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обработка загрузки DXF или ввода имени."""
-    user_id = update.effective_user.id
-
-    # Загрузка DXF
-    if update.message.document and context.user_data.get("waiting_upload"):
-        doc = update.message.document
-        if not (doc.file_name or "").lower().endswith(".dxf"):
-            await update.message.reply_text("Нужен файл с расширением .dxf")
-            return WAITING_DXF_CHOICE
-
-        file = await context.bot.get_file(doc.file_id)
-        safe_name = re.sub(r'[\\/*?:"<>|]', "_", doc.file_name)
-        dxf_path = WORK_DIR / f"user_{user_id}_{safe_name}"
-        await file.download_to_drive(dxf_path)
-        context.user_data["dxf_path"] = str(dxf_path)
-        context.user_data.pop("waiting_upload", None)
-
-        await update.message.reply_text(f"Файл «{safe_name}» загружен.")
-        await ask_sizes_message(update, context)
-        return WAITING_SIZES
-
-    # Ввод своего имени
-    if context.user_data.get("waiting_custom_name") and update.message.text:
-        name = update.message.text.strip()
-        if not name.lower().endswith(".dxf"):
-            name += ".dxf"
-        name = re.sub(r'[\\/*?:"<>|]', "_", name)
-        dxf_path = WORK_DIR / f"user_{user_id}_{name}"
-        context.user_data["dxf_path"] = str(dxf_path)
-        context.user_data.pop("waiting_custom_name", None)
-
-        await ask_sizes_message(update, context)
-        return WAITING_SIZES
-
-    await update.message.reply_text("Пришлите DXF или напишите имя файла.")
-    return WAITING_DXF_CHOICE
-
-
-async def ask_sizes(query, context):
     points = context.user_data["points"]
     auto_c, auto_t = calculate_auto_sizes(points)
-
-    keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton(f"🤖 Авто ({auto_c} / {auto_t})", callback_data=f"size_auto")],
-        [
-            InlineKeyboardButton("0.4 / 0.6", callback_data="size_0.4_0.6"),
-            InlineKeyboardButton("0.6 / 0.8", callback_data="size_0.6_0.8"),
-        ],
-        [
-            InlineKeyboardButton("0.8 / 1.0", callback_data="size_0.8_1.0"),
-            InlineKeyboardButton("1.2 / 1.5", callback_data="size_1.2_1.5"),
-        ],
-        [InlineKeyboardButton("✏️ Ввести свои значения", callback_data="size_custom")],
-    ])
     await query.edit_message_text(
         "Выберите размер креста и высоту текста:",
-        reply_markup=keyboard
+        reply_markup=sizes_keyboard(auto_c, auto_t),
     )
-
-
-async def ask_sizes_message(update, context):
-    points = context.user_data["points"]
-    auto_c, auto_t = calculate_auto_sizes(points)
-
-    keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton(f"🤖 Авто ({auto_c} / {auto_t})", callback_data="size_auto")],
-        [
-            InlineKeyboardButton("0.4 / 0.6", callback_data="size_0.4_0.6"),
-            InlineKeyboardButton("0.6 / 0.8", callback_data="size_0.6_0.8"),
-        ],
-        [
-            InlineKeyboardButton("0.8 / 1.0", callback_data="size_0.8_1.0"),
-            InlineKeyboardButton("1.2 / 1.5", callback_data="size_1.2_1.5"),
-        ],
-        [InlineKeyboardButton("✏️ Ввести свои значения", callback_data="size_custom")],
-    ])
-    await update.message.reply_text(
-        "Выберите размер креста и высоту текста:",
-        reply_markup=keyboard
-    )
+    return WAITING_SIZES
 
 
 async def handle_size_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -365,81 +653,68 @@ async def handle_size_choice(update: Update, context: ContextTypes.DEFAULT_TYPE)
     if data == "size_custom":
         await query.edit_message_text(
             "Напишите два числа: размер креста и высоту текста\n"
-            "Например: <code>0.55 0.75</code>",
-            parse_mode="HTML"
+            "Например: `0.55 0.75`",
+            parse_mode="Markdown",
         )
-        context.user_data["waiting_custom_size"] = True
-        return WAITING_SIZES
+        return WAITING_CUSTOM_SIZE
 
     if data == "size_auto":
-        cross, text = calculate_auto_sizes(points)
+        cross, text_h = calculate_auto_sizes(points)
     else:
-        # size_0.6_0.8
         parts = data.replace("size_", "").split("_")
         cross = float(parts[0])
-        text = float(parts[1])
-
-    context.user_data["cross_size"] = cross
-    context.user_data["text_height"] = text
-
-    # Превью
-    preview_path = WORK_DIR / f"user_{update.effective_user.id}_preview.png"
-    create_preview_image(points, cross, text, preview_path)
-
-    keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton("✅ Создать DXF", callback_data="create_yes")],
-        [InlineKeyboardButton("🔄 Изменить размеры", callback_data="create_change")],
-        [InlineKeyboardButton("📂 Загрузить другой DXF", callback_data="create_upload")],
-    ])
-
-    with open(preview_path, "rb") as f:
-        await context.bot.send_photo(
-            chat_id=query.message.chat_id,
-            photo=f,
-            caption=f"Превью\nКрест: <b>{cross}</b>   Текст: <b>{text}</b>",
-            parse_mode="HTML",
-            reply_markup=keyboard
-        )
-    await query.delete_message()
-    return WAITING_PREVIEW
-
-
-async def handle_custom_size(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.user_data.get("waiting_custom_size"):
-        return WAITING_SIZES
-
-    text = update.message.text.strip()
-    nums = re.findall(r"[\d.,]+", text)
-    nums = [float(n.replace(",", ".")) for n in nums]
-
-    if len(nums) < 2:
-        await update.message.reply_text("Нужно два числа. Пример: 0.5 0.7")
-        return WAITING_SIZES
-
-    cross, text_h = nums[0], nums[1]
-    cross = max(0.15, min(cross, 4.0))
-    text_h = max(0.2, min(text_h, 5.0))
+        text_h = float(parts[1])
 
     context.user_data["cross_size"] = cross
     context.user_data["text_height"] = text_h
-    context.user_data.pop("waiting_custom_size", None)
+    context.user_data["_uid"] = query.from_user.id
+    try:
+        await query.delete_message()
+    except Exception:
+        pass
+    return await send_preview_photo(query.message.chat_id, context)
 
+
+async def handle_custom_size(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text.strip()
+    nums = re.findall(r"[\d.,]+", text)
+    nums = [float(n.replace(",", ".")) for n in nums]
+    if len(nums) < 2:
+        await update.message.reply_text("Нужно два числа. Пример: `0.5 0.7`", parse_mode="Markdown")
+        return WAITING_CUSTOM_SIZE
+
+    cross = max(0.15, min(nums[0], 4.0))
+    text_h = max(0.2, min(nums[1], 5.0))
+    context.user_data["cross_size"] = cross
+    context.user_data["text_height"] = text_h
+    context.user_data["_uid"] = update.effective_user.id
+
+    return await send_preview_photo(update.effective_chat.id, context)
+
+
+async def send_preview_photo(chat_id: int, context: ContextTypes.DEFAULT_TYPE):
     points = context.user_data["points"]
-    preview_path = WORK_DIR / f"user_{update.effective_user.id}_preview.png"
+    cross = context.user_data["cross_size"]
+    text_h = context.user_data["text_height"]
+    user_id = context.user_data.get("_uid") or 0
+
+    tmp = user_tmp(user_id)
+    preview_path = tmp / "preview.png"
     create_preview_image(points, cross, text_h, preview_path)
 
-    keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton("✅ Создать DXF", callback_data="create_yes")],
-        [InlineKeyboardButton("🔄 Изменить размеры", callback_data="create_change")],
-        [InlineKeyboardButton("📂 Загрузить другой DXF", callback_data="create_upload")],
-    ])
-
+    caption = (
+        f"Превью точек\n"
+        f"Крест: *{cross}*   Текст: *{text_h}*\n\n"
+        "Можно сразу создать DXF или добавить DXF-проект как *подложку* "
+        "(с проверкой системы координат)."
+    )
     with open(preview_path, "rb") as f:
-        await update.message.reply_photo(
+        await context.bot.send_photo(
+            chat_id=chat_id,
             photo=f,
-            caption=f"Превью\nКрест: <b>{cross}</b>   Текст: <b>{text_h}</b>",
-            parse_mode="HTML",
-            reply_markup=keyboard
+            caption=caption,
+            parse_mode="Markdown",
+            reply_markup=preview_keyboard(),
         )
     return WAITING_PREVIEW
 
@@ -449,46 +724,223 @@ async def handle_preview(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
     data = query.data
     user_id = update.effective_user.id
+    context.user_data["_uid"] = user_id
 
-    if data == "create_change":
-        await ask_sizes(query, context)
+    if data == "change_sizes":
+        points = context.user_data["points"]
+        auto_c, auto_t = calculate_auto_sizes(points)
+        await query.edit_message_caption(
+            caption="Выберите размер креста и высоту текста:",
+            reply_markup=sizes_keyboard(auto_c, auto_t),
+        )
         return WAITING_SIZES
 
-    if data == "create_upload":
-        await query.edit_message_caption(caption="Пришлите DXF-файл, в который нужно добавить точки:")
-        context.user_data["waiting_upload"] = True
-        return WAITING_DXF_CHOICE
+    if data == "add_underlay":
+        await query.edit_message_caption(
+            caption="Пришлите DXF-файл, который станет *подложкой* (контуры проекта).\n"
+                    "После загрузки будет проверка системы координат.",
+            parse_mode="Markdown",
+        )
+        context.user_data["waiting_underlay"] = True
+        return WAITING_UNDERLAY
 
-    # Создаём файл
-    points = context.user_data["points"]
-    dxf_path = Path(context.user_data["dxf_path"])
-    cross = context.user_data["cross_size"]
-    text_h = context.user_data["text_height"]
+    if data == "create_plain":
+        return await do_create_dxf(query, context, underlay=None)
 
-    await query.edit_message_caption(caption="Создаю DXF...")
 
-    try:
-        added = add_points_to_dxf(dxf_path, points, cross, text_h)
-    except Exception as e:
-        await query.edit_message_caption(caption=f"Ошибка: {e}")
+async def handle_underlay_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.user_data.get("waiting_underlay"):
+        return WAITING_UNDERLAY
+
+    document = update.message.document
+    if not document or not (document.file_name or "").lower().endswith(".dxf"):
+        await update.message.reply_text("Нужен файл `.dxf`")
+        return WAITING_UNDERLAY
+
+    user_id = update.effective_user.id
+    tmp = user_tmp(user_id)
+    underlay_path = tmp / "underlay.dxf"
+    file = await context.bot.get_file(document.file_id)
+    await file.download_to_drive(underlay_path)
+
+    context.user_data["underlay_path"] = str(underlay_path)
+    context.user_data.pop("waiting_underlay", None)
+    context.user_data["swap_xy"] = False
+    context.user_data["shift"] = (0.0, 0.0)
+
+    await update.message.reply_text("DXF принят. Запускаю *Модуль 0* — проверку СК…", parse_mode="Markdown")
+    return await run_cs_check(update, context)
+
+
+async def run_cs_check(update: Update, context: ContextTypes.DEFAULT_TYPE, force: bool = False):
+    points = context.user_data.get("points")
+    underlay_path = context.user_data.get("underlay_path")
+    if not points or not underlay_path or not Path(underlay_path).exists():
+        await update.effective_message.reply_text("Файлы потеряны — /start")
         return ConversationHandler.END
 
-    display_name = get_display_name(dxf_path, user_id)
+    shift = tuple(context.user_data.get("shift", (0.0, 0.0)))
+    swap = bool(context.user_data.get("swap_xy"))
+
+    pts_for_check = points
+    if swap:
+        pts_for_check = [(pid, y, x, z) for pid, x, y, z in points]
+
+    try:
+        geom = parse_dxf_geom(Path(underlay_path), shift=shift)
+    except Exception as e:
+        await update.effective_message.reply_text(
+            f"Ошибка чтения DXF: `{e}`\nПришлите другой файл или /cancel",
+            parse_mode="Markdown",
+        )
+        return WAITING_UNDERLAY
+
+    context.user_data["underlay_geom"] = geom
+    rep = check_cs(pts_for_check, geom.segments, shift)
+
+    text = cs_text(rep, shift, swapped=swap)
+    msg = update.effective_message
+    if rep.ok:
+        await msg.reply_text(text, parse_mode="Markdown")
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("✅ Создать DXF с подложкой", callback_data="create_with_underlay")],
+            [InlineKeyboardButton("🔁 Перепроверить СК", callback_data="cs_recheck")],
+        ])
+        tmp = user_tmp(update.effective_user.id)
+        preview_path = tmp / "preview_cs.png"
+        cross = context.user_data["cross_size"]
+        text_h = context.user_data["text_height"]
+        create_preview_image(
+            pts_for_check, cross, text_h, preview_path,
+            underlay=geom, title_extra="подложка + СК OK",
+        )
+        with open(preview_path, "rb") as f:
+            await context.bot.send_photo(
+                chat_id=msg.chat_id,
+                photo=f,
+                caption="СК в порядке. Можно создавать файл.",
+                reply_markup=keyboard,
+            )
+        return WAITING_CS
+    else:
+        await msg.reply_text(text, parse_mode="Markdown", reply_markup=cs_kb(swap))
+        return WAITING_CS
+
+
+async def cs_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    data = query.data
+
+    if data == "cs_swap":
+        context.user_data["swap_xy"] = not bool(context.user_data.get("swap_xy"))
+        await query.edit_message_text("Ориентация переключена, перепроверяю…")
+        return await run_cs_check(update, context, force=True)
+
+    if data == "cs_keep":
+        await query.edit_message_text("Оставляю текущую ориентацию / сдвиг.")
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("✅ Создать DXF с подложкой", callback_data="create_with_underlay")],
+        ])
+        await query.message.reply_text(
+            "Можно создать файл (с предупреждением, если СК далеко).",
+            reply_markup=keyboard,
+        )
+        return WAITING_CS
+
+    if data == "cs_shift":
+        await query.message.reply_text(
+            "Пришлите `X0 Y0` в метрах (оси DXF), например:\n`2860.000 9500.000`",
+            parse_mode="Markdown",
+        )
+        return WAITING_SHIFT
+
+    if data == "cs_recheck":
+        await query.answer("Перепроверяю…")
+        return await run_cs_check(update, context, force=True)
+
+    if data == "create_with_underlay":
+        return await do_create_dxf(query, context, underlay=context.user_data.get("underlay_geom"))
+
+
+async def handle_shift_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    m = re.match(r"^\s*([+-]?[\d.,]+)[;\s]+([+-]?[\d.,]+)\s*$", update.message.text or "")
+    if not m:
+        await update.message.reply_text(
+            "Два числа через пробел или `;`:\n`2860.000 9500.000`",
+            parse_mode="Markdown",
+        )
+        return WAITING_SHIFT
+
+    def num(s):
+        return float(s.replace(",", "."))
+
+    context.user_data["shift"] = (num(m.group(1)), num(m.group(2)))
+    await update.message.reply_text("SHIFT принят, перепроверяю СК…")
+    return await run_cs_check(update, context, force=True)
+
+
+async def do_create_dxf(query, context: ContextTypes.DEFAULT_TYPE, underlay: Optional[DxfGeom]):
+    user_id = (query.from_user.id if getattr(query, "from_user", None)
+               else context.user_data.get("_uid", 0))
+    points = list(context.user_data["points"])
+    if context.user_data.get("swap_xy"):
+        points = [(pid, y, x, z) for pid, x, y, z in points]
+
+    cross = context.user_data["cross_size"]
+    text_h = context.user_data["text_height"]
+    tmp = user_tmp(user_id)
+    name = f"points_{datetime.now().strftime('%Y%m%d_%H%M%S')}.dxf"
+    dxf_path = tmp / name
+    chat_id = query.message.chat_id
+
+    try:
+        if hasattr(query, "edit_message_caption"):
+            await query.edit_message_caption(caption="Создаю DXF…")
+    except Exception:
+        pass
+
+    try:
+        added = add_points_and_underlay_to_dxf(
+            dxf_path, points, cross, text_h, underlay=underlay
+        )
+    except Exception as e:
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=f"Ошибка создания DXF: `{e}`",
+            parse_mode="Markdown",
+        )
+        return ConversationHandler.END
+
     context.user_data["last_dxf"] = str(dxf_path)
 
-    keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton("📄 Сделать PDF", callback_data="make_pdf")]
-    ])
+    note = "с подложкой" if underlay else "без подложки"
+    swap_note = " (X↔Y)" if context.user_data.get("swap_xy") else ""
+    shift = context.user_data.get("shift", (0.0, 0.0))
+    shift_note = (
+        f", SHIFT={shift[0]:.3f};{shift[1]:.3f}"
+        if any(abs(v) > 1e-9 for v in shift) else ""
+    )
 
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("📄 Сделать PDF", callback_data="make_pdf")],
+    ])
     await context.bot.send_message(
-        chat_id=query.message.chat_id,
-        text=f"✅ Готово!\nФайл: <b>{display_name}</b>\nТочек: {added}\nКрест: {cross}  |  Текст: {text_h}",
-        parse_mode="HTML",
-        reply_markup=keyboard
+        chat_id=chat_id,
+        text=(
+            f"✅ Готово ({note}{swap_note}{shift_note})\n"
+            f"Файл: `{name}`\n"
+            f"Точек: {added}  |  Крест: {cross}  |  Текст: {text_h}"
+        ),
+        parse_mode="Markdown",
+        reply_markup=keyboard,
     )
     with open(dxf_path, "rb") as f:
-        await context.bot.send_document(chat_id=query.message.chat_id, document=f, filename=display_name)
-
+        await context.bot.send_document(
+            chat_id=chat_id,
+            document=f,
+            filename=name,
+        )
     return ConversationHandler.END
 
 
@@ -499,45 +951,63 @@ async def button_make_pdf(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not path or not Path(path).exists():
         await query.answer("Файл не найден", show_alert=True)
         return
-    await query.edit_message_text("Делаю PDF...")
+    await query.edit_message_text("Делаю PDF…")
     pdf_path = Path(path).with_suffix(".pdf")
     if dxf_to_pdf(Path(path), pdf_path):
         with open(pdf_path, "rb") as f:
-            await context.bot.send_document(chat_id=query.message.chat_id, document=f,
-                                            filename=get_display_name(pdf_path, update.effective_user.id))
+            await context.bot.send_document(
+                chat_id=query.message.chat_id,
+                document=f,
+                filename=pdf_path.name,
+            )
         await query.edit_message_text("PDF отправлен ✅")
     else:
-        await query.edit_message_text("Ошибка PDF")
-
-
-async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data.clear()
-    await update.message.reply_text("Отменено.")
-    return ConversationHandler.END
+        await query.edit_message_text("Ошибка при создании PDF")
 
 
 def main():
-    if BOT_TOKEN == "ВАШ_ТОКЕН_ОТ_BOTFATHER":
-        print("Укажите токен!")
+    if not BOT_TOKEN or BOT_TOKEN.startswith("ВАШ"):
+        print("Укажите BOT_TOKEN в коде!")
         return
 
-    app = Application.builder().token(BOT_TOKEN).build()
+    app = (
+        Application.builder()
+        .token(BOT_TOKEN)
+        .concurrent_updates(False)
+        .build()
+    )
 
     conv = ConversationHandler(
-        entry_points=[MessageHandler(filters.Document.FileExtension("txt"), handle_txt)],
+        entry_points=[
+            MessageHandler(filters.Document.FileExtension("txt"), handle_txt),
+        ],
         states={
-            WAITING_CONFIRM: [CallbackQueryHandler(handle_confirm)],
-            WAITING_DXF_CHOICE: [
-                CallbackQueryHandler(handle_dxf_choice),
-                MessageHandler(filters.Document.ALL | filters.TEXT, handle_dxf_input),
+            WAITING_CONFIRM: [
+                CallbackQueryHandler(handle_confirm, pattern="^confirm_"),
             ],
             WAITING_SIZES: [
-                CallbackQueryHandler(handle_size_choice),
+                CallbackQueryHandler(handle_size_choice, pattern="^size_"),
+            ],
+            WAITING_CUSTOM_SIZE: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, handle_custom_size),
             ],
-            WAITING_PREVIEW: [CallbackQueryHandler(handle_preview)],
+            WAITING_PREVIEW: [
+                CallbackQueryHandler(handle_preview, pattern="^(create_plain|add_underlay|change_sizes)$"),
+            ],
+            WAITING_UNDERLAY: [
+                MessageHandler(filters.Document.FileExtension("dxf"), handle_underlay_upload),
+            ],
+            WAITING_CS: [
+                CallbackQueryHandler(cs_callback, pattern="^(cs_|create_with_underlay)"),
+            ],
+            WAITING_SHIFT: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_shift_input),
+            ],
         },
-        fallbacks=[CommandHandler("cancel", cancel)],
+        fallbacks=[
+            CommandHandler("cancel", cancel),
+            CommandHandler("start", start),
+        ],
         allow_reentry=True,
     )
 
@@ -547,7 +1017,7 @@ def main():
     app.add_handler(conv)
     app.add_handler(CallbackQueryHandler(button_make_pdf, pattern="^make_pdf$"))
 
-    print("Бот запущен...")
+    print("Бот запущен…")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
