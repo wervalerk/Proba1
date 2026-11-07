@@ -396,8 +396,6 @@ def create_preview_image(
         for pts, closed, _ in underlay.polylines:
             xs = [p[0] for p in pts]
             ys = [p[1] for p in pts]
-            if closed and len(pts) >= 3:
-                ax.fill(xs, ys, facecolor="#eaf5df", edgecolor="none", zorder=0, alpha=0.7)
             ax.plot(xs, ys, color="#7d7d7d", lw=0.7, zorder=1)
 
     xs = [p[1] for p in points]
@@ -447,10 +445,12 @@ def add_points_and_underlay_to_dxf(
 
     msp = doc.modelspace()
 
-    for name, color in (("PROJ", 8), ("HATCH", 3), ("POINTS", 1), ("TEXT", 3)):
+    # слои
+    for name, color in (("PROJ", 8), ("POINTS", 1), ("TEXT", 3)):
         if name not in doc.layers:
             doc.layers.add(name, color=color)
 
+    # ── подложка (только контуры, без штриховки) ──
     if underlay:
         for pts, closed, _ in underlay.polylines:
             xy = [(p[0], p[1]) for p in pts]
@@ -461,14 +461,8 @@ def add_points_and_underlay_to_dxf(
                 close=closed,
                 dxfattribs={"layer": "PROJ", "color": 8},
             )
-            if closed and len(xy) >= 3:
-                try:
-                    h = msp.add_hatch(dxfattribs={"layer": "HATCH", "color": 3})
-                    h.set_pattern_fill("ANSI31", scale=max(cross_size * 0.4, 0.02), color=3)
-                    h.paths.add_polyline_path(xy, is_closed=True)
-                except Exception:
-                    pass
 
+    # ── блок точки ──
     block_name = "POINT_WITH_ID"
     if block_name in doc.blocks:
         doc.blocks.delete_block(block_name, safe=True)
@@ -737,8 +731,11 @@ async def handle_preview(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if data == "add_underlay":
         await query.edit_message_caption(
-            caption="Пришлите DXF-файл, который станет *подложкой* (контуры проекта).\n"
-                    "После загрузки будет проверка системы координат.",
+            caption=(
+                "📂 *Подгрузите файл DXF*\n\n"
+                "Пришлите DXF-файл, который станет *подложкой* (контуры проекта).\n"
+                "После загрузки будет проверка системы координат (Модуль 0)."
+            ),
             parse_mode="Markdown",
         )
         context.user_data["waiting_underlay"] = True
