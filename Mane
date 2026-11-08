@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
 Telegram-бот: точки из TXT → DXF.
-- После TXT сразу размеры и превью (без раннего запроса DXF).
-- Позже можно добавить DXF как подложку (геометрия проекта).
+- После TXT сразу размеры и превью.
+- Подложка: выбор из памяти (до 5 шт.) ИЛИ загрузка новой.
 - Модуль 0: проверка системы координат (медиана до контура, X↔Y, X0 Y0).
-- Память: до 5 сохраненных подложек DXF.
+- ВАЖНО: Использованная подложка НЕ сохраняется в память автоматически.
 """
 
 from __future__ import annotations
@@ -449,7 +449,7 @@ def add_points_and_underlay_to_dxf(
 
     # слои
     for name, color in (("PROJ", 8), ("POINTS", 1), ("TEXT", 3)):
-        if name not в doc.layers:
+        if name not in doc.layers:
             doc.layers.add(name, color=color)
 
     # ── подложка (только контуры, без штриховки) ──
@@ -548,6 +548,7 @@ def preview_keyboard() -> InlineKeyboardMarkup:
 def underlay_memory_keyboard(context: ContextTypes.DEFAULT_TYPE) -> InlineKeyboardMarkup:
     buttons = []
     memory = context.user_data.get('underlay_memory', {})
+    # Показываем только занятые слоты
     for i in range(1, 6):
         name = memory.get(i, {}).get('name')
         if name:
@@ -820,7 +821,4 @@ async def handle_underlay_memory_choice(update: Update, context: ContextTypes.DE
     if data == "mem_upload_new":
         context.user_data["waiting_for_upload"] = True
         await query.edit_message_caption(
-            caption="📤 *Загрузка нового DXF*\nПришлите файл в чат.",
-            parse_mode="Markdown",
-        )
-        return WAITING_UNDER
+            caption
