@@ -449,7 +449,7 @@ def add_points_and_underlay_to_dxf(
 
     # слои
     for name, color in (("PROJ", 8), ("POINTS", 1), ("TEXT", 3)):
-        if name not in doc.layers:
+        if name not в doc.layers:
             doc.layers.add(name, color=color)
 
     # ── подложка (только контуры, без штриховки) ──
@@ -800,17 +800,27 @@ async def handle_new_file_cancel(update: Update, context: ContextTypes.DEFAULT_T
     return WAITING_PREVIEW
 
 
-async def handle_underlay_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Сюда попадаем только если пользователь нажал "📤 Загрузить новый DXF"
-    document = update.message.document
-    if not document or not (document.file_name or "").lower().endswith(".dxf"):
-        await update.message.reply_text("Нужен файл `.dxf`")
-        return WAITING_UNDERLAY
+async def handle_underlay_memory_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    data = query.data
 
-    user_id = update.effective_user.id
-    tmp = user_tmp(user_id)
-    underlay_path = tmp / "underlay.dxf"
-    file = await context.bot.get_file(document.file_id)
-    await file.download_to_drive(underlay_path)
+    if data == "mem_cancel":
+        await query.edit_message_caption(
+            caption=(
+                f"Превью точек\n"
+                f"Крест: *{context.user_data['cross_size']}*   Текст: *{context.user_data['text_height']}*\n\n"
+                "Можно сразу создать DXF или добавить DXF-проект как *подложку*."
+            ),
+            reply_markup=preview_keyboard(),
+            parse_mode="Markdown",
+        )
+        return WAITING_PREVIEW
 
-    context.user
+    if data == "mem_upload_new":
+        context.user_data["waiting_for_upload"] = True
+        await query.edit_message_caption(
+            caption="📤 *Загрузка нового DXF*\nПришлите файл в чат.",
+            parse_mode="Markdown",
+        )
+        return WAITING_UNDER
