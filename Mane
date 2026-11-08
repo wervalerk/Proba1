@@ -57,7 +57,7 @@ logger = logging.getLogger(__name__)
     WAITING_SIZES,
     WAITING_CUSTOM_SIZE,
     WAITING_PREVIEW,
-    WAITING_UNDERLAY,      # выбор памяти или загрузка нового DXF
+    WAITING_UNDERLAY,      # ждём DXF-подложку (или выбор из памяти)
     WAITING_CS,            # проверка СК / кнопки
     WAITING_SHIFT,         # ввод X0 Y0
     WAITING_NEW_FILE,      # подтверждение сброса
@@ -813,4 +813,17 @@ async def handle_underlay_upload(update: Update, context: ContextTypes.DEFAULT_T
     file = await context.bot.get_file(document.file_id)
     await file.download_to_drive(underlay_path)
 
-    context.user
+    context.user_data["underlay_path"] = str(underlay_path)
+    context.user_data["swap_xy"] = False
+    context.user_data["shift"] = (0.0, 0.0)
+
+    await update.message.reply_text("DXF принят. Запускаю *Модуль 0* — проверку СК…", parse_mode="Markdown")
+    return await run_cs_check(update, context)
+
+
+async def handle_underlay_memory_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    data = query.data
+
+    if data ==
