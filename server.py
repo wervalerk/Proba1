@@ -1,9 +1,3 @@
-Ниже — цельный файл с учётом всех замечаний из разбора (токен из окружения, память подложек на диске, единый swap/shift для точек и подложки, тяжёлые расчёты в потоке, HTML вместо Markdown и т.д.).
-
-**Установка:** `pip install "python-telegram-bot>=20" ezdxf matplotlib shapely` (shapely необязательна — без неё будет медленный перебор).  
-**Запуск:** `BOT_TOKEN=... python bot.py`
-
-```python
 #!/usr/bin/env python3
 """
 Telegram-бот: точки из TXT → DXF + PDF.
@@ -57,7 +51,7 @@ except Exception:  # pragma: no cover
 # ================== НАСТРОЙКИ ==================
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "").strip()
 if not BOT_TOKEN:
-    raise SystemExit("Задайте переменную окружения BOT_TOKEN")
+    raise SystemExit("9000882141:AAFEtOR78VeKCCuHfrE68LNNbc2rZU8Z-Dc")
 
 BASE_DIR = Path(__file__).resolve().parent
 WORK_DIR = BASE_DIR / "bot_work"
@@ -1046,19 +1040,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-```
-
-## Что изменилось и как это работает
-
-| Требование | Где |
-|---|---|
-| Импорт TXT (`№ X Y H` или `X Y H`, BOM/UTF-16/cp1251) | `decode_bytes`, `parse_points_from_txt` — решение «первый столбец = №» принимается для всего файла |
-| Проверка СК | `run_cs` → `check_cs` (Shapely-индекс, если есть), кнопки swap / X0 Y0 / перепроверить / другая подложка |
-| Превью точек | `send_preview` — без подложки и с подложкой (серый контур) |
-| PDF + DXF | `build_outputs` → `write_dxf` (блок с атрибутом ID, подложка в слое PROJ) + `write_pdf` (ezdxf drawing addon) |
-| Кнопка «Новый файл» | `new_file` на всех этапах → подтверждение → `reset_session` (память подложек **не** трогается) |
-| 5 ячеек подложек | `memory.json` + `underlays/slot{N}.dxf` на диске; выбор в `memory_keyboard`, сохранение только по кнопке «💾 Сохранить подложку» после создания; `/memory` показывает слоты |
-
-Ключевой инвариант соблюдён: `effective_points()` (с учётом X↔Y) и `parse_dxf_geom(..., shift)` — одни и те же данные идут и в проверку, и в превью, и в DXF/PDF. В слот вместе с файлом сохраняются единицы и сдвиг, поэтому подложка из памяти сразу встаёт на место.
-
-Перед запуском не забудьте отозвать старый токен в BotFather.
