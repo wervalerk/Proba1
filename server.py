@@ -51,7 +51,7 @@ except Exception:  # pragma: no cover
 # ================== НАСТРОЙКИ ==================
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "").strip()
 if not BOT_TOKEN:
-    raise SystemExit("9000882141:AAFEtOR78VeKCCuHfrE68LNNbc2rZU8Z-Dc")
+    raise SystemExit("Задайте переменную окружения BOT_TOKEN")
 
 BASE_DIR = Path(__file__).resolve().parent
 WORK_DIR = BASE_DIR / "bot_work"
