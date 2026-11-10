@@ -1,20 +1,16 @@
 #!/usr/bin/env python3
 """
 Telegram-бот: точки из TXT → DXF + PDF.
-
 Поток:
   TXT → подтверждение → размеры креста/текста → превью
       → [создать без подложки] | [подложка: из памяти (5 слотов) / новая]
       → Модуль 0: проверка СК (X↔Y, X0 Y0) → превью с подложкой
       → DXF + PDF → [сохранить подложку в слот] | [новый файл]
-
 Подложка НЕ сохраняется в память автоматически — только по кнопке.
 """
 from __future__ import annotations
-
 import matplotlib
 matplotlib.use("Agg")  # ОБЯЗАТЕЛЬНО до любых импортов pyplot / ezdxf.addons.drawing
-
 import asyncio
 import html
 import json
@@ -29,68 +25,53 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 from uuid import uuid4
-
 import ezdxf
 import matplotlib.pyplot as plt
 from ezdxf import bbox, units
-from ezdxf.addons.drawing.matplotlib import qsave
+from ezdxf.addons.drawing import matplotlib as ezdxf_mpl
 from ezdxf.path import make_path
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ParseMode
 from telegram.ext import (Application, CallbackQueryHandler, CommandHandler,
                           ContextTypes, ConversationHandler, MessageHandler,
                           filters)
-
 try:
     from shapely.geometry import LineString, Point
     from shapely.strtree import STRtree
     HAS_SHAPELY = True
 except Exception:  # pragma: no cover
     HAS_SHAPELY = False
-
 # ================== НАСТРОЙКИ ==================
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "").strip()
 if not BOT_TOKEN:
     raise SystemExit("Задайте переменную окружения BOT_TOKEN")
-
 BASE_DIR = Path(__file__).resolve().parent
 WORK_DIR = BASE_DIR / "bot_work"
 WORK_DIR.mkdir(parents=True, exist_ok=True)
-
 MEMORY_SLOTS = 5
 NEAR_M = 5.0        # «рядом»: медиана до ближайшего контура, м
 SWAP_RATIO = 3.0    # во сколько раз X↔Y должна улучшить, чтобы предложить
 MAX_CS_POINTS = 3000  # для медианы хватит выборки
 # ==============================================
-
 logging.basicConfig(format="%(asctime)s %(name)s %(levelname)s %(message)s", level=logging.INFO)
 logger = logging.getLogger("txt2dxf")
-
 (WAITING_CONFIRM, WAITING_SIZES, WAITING_CUSTOM_SIZE, WAITING_PREVIEW,
  WAITING_UNDERLAY, WAITING_DXF_UPLOAD, WAITING_UNITS, WAITING_CS,
  WAITING_SHIFT, WAITING_NEW_FILE, WAITING_SAVE_SLOT, WAITING_DONE) = range(12)
-
 Point4 = Tuple[Any, float, float, float]
-
-
 # ═══════════════════════════════════════════════════════════════
 #  Файлы пользователя и память подложек (на диске → переживает рестарт)
 # ═══════════════════════════════════════════════════════════════
-
 def user_dir(uid: int) -> Path:
     p = WORK_DIR / f"user_{uid}"
     (p / "in").mkdir(parents=True, exist_ok=True)
     (p / "out").mkdir(parents=True, exist_ok=True)
     (p / "underlays").mkdir(parents=True, exist_ok=True)
     return p
-
-
 def safe_name(name: str, ext: str) -> str:
     stem = Path(name or "file").stem
     stem = re.sub(r"[^A-Za-z0-9А-Яа-я_.-]+", "_", stem).strip("._") or "file"
     return f"{stem[:60]}{ext}"
-
-
 def load_memory(uid: int) -> Dict[int, dict]:
     p = user_dir(uid) / "memory.json"
     if not p.exists():
@@ -103,24 +84,17 @@ def load_memory(uid: int) -> Dict[int, dict]:
     except Exception as e:
         logger.warning("memory.json broken: %s", e)
         return {}
-
-
 def save_memory(uid: int, mem: Dict[int, dict]) -> None:
     p = user_dir(uid) / "memory.json"
     p.write_text(json.dumps({str(k): v for k, v in mem.items()}, ensure_ascii=False, indent=1), "utf-8")
-
-
 def reset_session(context: ContextTypes.DEFAULT_TYPE, uid: int) -> None:
     context.user_data.clear()
     context.user_data["_uid"] = uid
     context.user_data["swap_xy"] = False
     context.user_data["shift"] = (0.0, 0.0)
-
-
 # ═══════════════════════════════════════════════════════════════
 #  Парсинг TXT
 # ═══════════════════════════════════════════════════════════════
-
 def decode_bytes(data: bytes) -> str:
     for enc in ("utf-8-sig", "utf-16", "cp1251", "latin-1"):
         try:
@@ -128,86 +102,99 @@ def decode_bytes(data: bytes) -> str:
         except UnicodeDecodeError:
             continue
     return data.decode("utf-8", errors="ignore")
-
-
 _NUM = re.compile(r"[-+]?(?:\d+\.?\d*|\.\d+)(?:[eE][-+]?\d+)?")
-
-
 def parse_points_from_txt(text: str) -> Tuple[List[Point4], int]:
-    """Возвращает (points, skipped_lines). Решение «первый столбец — ID» принимается на уровне файла."""
+    """
+    Парсит точки из TXT.
+    Поддерживаемые разделители: пробел, таб, запятая, точка с запятой.
+    Десятичный разделитель: точка или запятая.
+    Форматы строк:
+        №  X  Y  [H]
+        X  Y  [H]
+    """
     rows: List[List[float]] = []
     skipped = 0
+
     for line in text.splitlines():
         line = line.strip()
         if not line or line.startswith("#"):
             continue
-        s = line.replace(";", " ").replace("\t", " ")
-        s = re.sub(r"(?<=\d),(?=\d)", ".", s) if re.search(r"\s", s) else s.replace(",", " ")
+
+        # 1. Все «разделители полей» → пробел
+        s = line.replace("\t", " ").replace(";", " ")
+
+        # 2. Если в строке уже есть пробелы — считаем запятую десятичной
+        #    и аккуратно заменяем только «число,число»
+        if re.search(r"\s", s):
+            s = re.sub(r"(?<=\d),(?=\d)", ".", s)
+        else:
+            # Нет пробелов — запятая почти наверняка разделитель полей
+            s = s.replace(",", " ")
+
+        # 3. Убираем лишние пробелы и берём токены
         tokens = s.split()
         nums = []
         bad = False
         for t in tokens:
+            # на всякий случай ещё раз заменим запятую на точку
+            t = t.replace(",", ".")
             if _NUM.fullmatch(t):
                 nums.append(float(t))
             else:
                 bad = True
                 break
+
         if bad or len(nums) < 2:
             skipped += 1
             continue
         rows.append(nums)
+
     if not rows:
         return [], skipped
 
+    # Определяем, является ли первый столбец ID
     first_is_id = (
         all(len(r) >= 3 for r in rows)
-        and all(r[0].is_integer() and 0 <= r[0] < 1e6 for r in rows)
+        and all(float(r[0]).is_integer() and 0 <= r[0] < 1_000_000 for r in rows)
         and len({int(r[0]) for r in rows}) == len(rows)
     )
+
     points: List[Point4] = []
     for i, r in enumerate(rows, 1):
         if first_is_id:
-            pid, x, y = int(r[0]), r[1], r[2]
+            pid = int(r[0])
+            x, y = r[1], r[2]
             z = r[3] if len(r) > 3 else 0.0
         else:
-            pid, x, y = i, r[0], r[1]
+            pid = i
+            x, y = r[0], r[1]
             z = r[2] if len(r) > 2 else 0.0
         points.append((pid, x, y, z))
+
     return points, skipped
-
-
 def effective_points(context: ContextTypes.DEFAULT_TYPE) -> List[Point4]:
     """Единственный источник правды: точки с учётом X↔Y — и для проверки, и для превью, и для DXF."""
     pts = context.user_data["points"]
     if context.user_data.get("swap_xy"):
         return [(pid, y, x, z) for pid, x, y, z in pts]
     return pts
-
-
 # ═══════════════════════════════════════════════════════════════
 #  Геометрия DXF
 # ═══════════════════════════════════════════════════════════════
-
 @dataclass
 class Seg:
     ax: float; ay: float; az: float
     bx: float; by: float; bz: float
     layer: str = "0"
-
-
 @dataclass
 class DxfGeom:
     polylines: List[Tuple[List[Tuple[float, float, float]], bool, str]]
     segments: List[Seg]
     scale_note: str
     has_z: bool
-
-
 SUPPORTED = {"LWPOLYLINE", "POLYLINE", "LINE", "ARC", "CIRCLE", "ELLIPSE", "SPLINE"}
 UNIT_TABLE = {1: 0.0254, 2: 0.3048, 4: 0.001, 5: 0.01, 6: 1.0, 7: 1000.0, 10: 0.9144}
 UNIT_OVERRIDE = {"m": 1.0, "cm": 0.01, "mm": 0.001}
-
-
 def walk(entities, depth: int = 0):
     for e in entities:
         if e.dxftype() == "INSERT" and depth < 3:
@@ -217,8 +204,6 @@ def walk(entities, depth: int = 0):
                 logger.warning("INSERT skipped: %s", ex)
         else:
             yield e
-
-
 def manual_pts(e):
     t = e.dxftype()
     if t == "LWPOLYLINE":
@@ -239,8 +224,6 @@ def manual_pts(e):
                  c.y + r * math.sin(math.radians(a0 + (a1 - a0) * i / (n - 1))), c.z)
                 for i in range(n)], t == "CIRCLE"
     return [], False
-
-
 def raw_path(e) -> Optional[dict]:
     if e.dxftype() not in SUPPORTED:
         return None
@@ -262,8 +245,6 @@ def raw_path(e) -> Optional[dict]:
     if closed and math.hypot(pts[-1][0] - pts[0][0], pts[-1][1] - pts[0][1]) > 1e-9:
         pts.append(pts[0])
     return {"pts": pts, "closed": closed, "layer": e.dxf.layer}
-
-
 def detect_units(path: Path) -> Tuple[Optional[str], float]:
     """(override-код если $INSUNITS известен, иначе None; максимальная |координата| для подсказки)."""
     doc = ezdxf.readfile(str(path))
@@ -278,8 +259,6 @@ def detect_units(path: Path) -> Tuple[Optional[str], float]:
     except Exception:
         pass
     return code, maxabs
-
-
 def parse_dxf_geom(path: Path, shift: Tuple[float, float] = (0.0, 0.0), unit_code: Optional[str] = None) -> DxfGeom:
     doc = ezdxf.readfile(str(path))
     raw = [r for r in (raw_path(e) for e in walk(doc.modelspace())) if r]
@@ -304,12 +283,9 @@ def parse_dxf_geom(path: Path, shift: Tuple[float, float] = (0.0, 0.0), unit_cod
         raise ValueError("После приведения единиц не осталось отрезков.")
     has_z = len({round(z, 3) for z in zs}) > 1 or any(abs(z) > 1e-9 for z in zs)
     return DxfGeom(polylines, segments, note, has_z)
-
-
 # ═══════════════════════════════════════════════════════════════
 #  Модуль 0 — проверка СК
 # ═══════════════════════════════════════════════════════════════
-
 @dataclass
 class CSReport:
     direct: float
@@ -318,8 +294,6 @@ class CSReport:
     c_dxf: Tuple[float, float]
     ok: bool
     suggest_swap: bool
-
-
 def _seg_dist(px, py, s: Seg) -> float:
     vx, vy = s.bx - s.ax, s.by - s.ay
     L2 = vx * vx + vy * vy
@@ -327,8 +301,6 @@ def _seg_dist(px, py, s: Seg) -> float:
         return math.hypot(px - s.ax, py - s.ay)
     t = max(0.0, min(1.0, ((px - s.ax) * vx + (py - s.ay) * vy) / L2))
     return math.hypot(px - (s.ax + t * vx), py - (s.ay + t * vy))
-
-
 def _median_nearest(points: List[Tuple[float, float]], segments: List[Seg]) -> float:
     if not points or not segments:
         return float("inf")
@@ -340,14 +312,10 @@ def _median_nearest(points: List[Tuple[float, float]], segments: List[Seg]) -> f
         tree = STRtree(lines)
         return statistics.median(lines[tree.nearest(Point(x, y))].distance(Point(x, y)) for x, y in points)
     return statistics.median(min(_seg_dist(x, y, s) for s in segments) for x, y in points)
-
-
 def _centroid(pts: List[Tuple[float, float]]) -> Tuple[float, float]:
     if not pts:
         return 0.0, 0.0
     return sum(p[0] for p in pts) / len(pts), sum(p[1] for p in pts) / len(pts)
-
-
 def check_cs(points: List[Point4], geom: DxfGeom) -> CSReport:
     """points — уже «эффективные» (с учётом текущего swap). geom — уже со сдвигом."""
     direct = [(x, y) for _, x, y, _ in points]
@@ -358,12 +326,8 @@ def check_cs(points: List[Point4], geom: DxfGeom) -> CSReport:
     suggest = (not ok) and d1 < d0 and (d1 <= NEAR_M or d1 * SWAP_RATIO <= d0)
     dxf_pts = [(s.ax, s.ay) for s in geom.segments]
     return CSReport(d0, d1, _centroid(direct), _centroid(dxf_pts), ok, suggest)
-
-
 def fmt(v: float) -> str:
     return "∞" if not math.isfinite(v) else f"{v:,.1f}".replace(",", " ")
-
-
 def cs_text(rep: CSReport, shift: Tuple[float, float], swapped: bool, note: str) -> str:
     lines = [
         "🔎 <b>Модуль 0 · проверка системы координат</b>",
@@ -387,8 +351,6 @@ def cs_text(rep: CSReport, shift: Tuple[float, float], swapped: bool, note: str)
             f"Можно просто прислать два числа сообщением."
         )
     return "\n".join(lines)
-
-
 def cs_keyboard(rep: CSReport, swapped: bool) -> InlineKeyboardMarkup:
     create_label = "✅ Создать DXF + PDF" if rep.ok else "⚠️ Создать как есть"
     return InlineKeyboardMarkup([
@@ -399,12 +361,9 @@ def cs_keyboard(rep: CSReport, swapped: bool) -> InlineKeyboardMarkup:
         [InlineKeyboardButton(create_label, callback_data="cs_create")],
         [InlineKeyboardButton("📄 Новый файл (сброс)", callback_data="new_file")],
     ])
-
-
 # ═══════════════════════════════════════════════════════════════
 #  Размеры, превью, DXF, PDF
 # ═══════════════════════════════════════════════════════════════
-
 def calculate_auto_sizes(points: List[Point4]) -> Tuple[float, float]:
     if len(points) < 2:
         return 0.7, 0.9
@@ -421,8 +380,6 @@ def calculate_auto_sizes(points: List[Point4]) -> Tuple[float, float]:
     cross = max(min(min_d * 0.28, 2.0), 0.35)
     text = max(min(min_d * 0.38, 2.5), 0.5)
     return round(cross, 2), round(text, 2)
-
-
 def create_preview_image(points: List[Point4], cross: float, text_h: float, out: Path,
                          underlay: Optional[DxfGeom] = None, title_extra: str = "") -> None:
     fig, ax = plt.subplots(figsize=(11, 8.5), dpi=130)
@@ -444,8 +401,6 @@ def create_preview_image(points: List[Point4], cross: float, text_h: float, out:
     fig.tight_layout()
     fig.savefig(out, dpi=130, bbox_inches="tight", facecolor="white")
     plt.close(fig)
-
-
 def write_dxf(dxf_path: Path, points: List[Point4], cross: float, text_h: float,
               underlay: Optional[DxfGeom]) -> None:
     doc = ezdxf.new(dxfversion="R2010")
@@ -455,7 +410,6 @@ def write_dxf(dxf_path: Path, points: List[Point4], cross: float, text_h: float,
     for name, color in (("PROJ", 8), ("POINTS", 1), ("TEXT", 3)):
         if name not in doc.layers:
             doc.layers.add(name, color=color)
-
     if underlay:
         for pts, closed, _ in underlay.polylines:
             if underlay.has_z:
@@ -465,7 +419,6 @@ def write_dxf(dxf_path: Path, points: List[Point4], cross: float, text_h: float,
                 if closed and len(xy) > 2 and math.hypot(xy[-1][0] - xy[0][0], xy[-1][1] - xy[0][1]) < 1e-9:
                     xy = xy[:-1]
                 msp.add_lwpolyline(xy, close=closed, dxfattribs={"layer": "PROJ"})
-
     blk = doc.blocks.new(name="POINT_WITH_ID")
     r = max(cross * 0.13, 0.04)
     off = text_h * 0.65
@@ -473,23 +426,18 @@ def write_dxf(dxf_path: Path, points: List[Point4], cross: float, text_h: float,
     blk.add_line((0, -cross / 2), (0, cross / 2), dxfattribs={"layer": "POINTS"})
     blk.add_circle((0, 0), radius=r, dxfattribs={"layer": "POINTS"})
     blk.add_attdef(tag="ID", insert=(off, off), dxfattribs={"layer": "TEXT", "height": text_h})
-
     for pid, x, y, z in points:
         ref = msp.add_blockref("POINT_WITH_ID", (x, y, z), dxfattribs={"layer": "POINTS"})
         ref.add_auto_attribs({"ID": str(pid)})
     doc.saveas(str(dxf_path))
-
-
 def write_pdf(dxf_path: Path, pdf_path: Path) -> bool:
     try:
         doc = ezdxf.readfile(str(dxf_path))
-        qsave(doc.modelspace(), str(pdf_path), dpi=200, bg="#FFFFFF", fg="#000000")
+        ezdxf_mpl.qsave(doc.modelspace(), str(pdf_path), dpi=200, bg="#FFFFFF", fg="#000000")
         return True
     except Exception as e:
         logger.error("PDF error: %s", e)
         return False
-
-
 def build_outputs(uid: int, points, cross, text_h, underlay) -> Tuple[Path, Optional[Path]]:
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     out = user_dir(uid) / "out"
@@ -497,12 +445,9 @@ def build_outputs(uid: int, points, cross, text_h, underlay) -> Tuple[Path, Opti
     pdf = out / f"points_{stamp}.pdf"
     write_dxf(dxf, points, cross, text_h, underlay)
     return dxf, (pdf if write_pdf(dxf, pdf) else None)
-
-
 # ═══════════════════════════════════════════════════════════════
 #  Клавиатуры / утилиты
 # ═══════════════════════════════════════════════════════════════
-
 def sizes_keyboard(ac: float, at: float) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [InlineKeyboardButton(f"🤖 Авто ({ac} / {at})", callback_data="size_auto")],
@@ -512,8 +457,6 @@ def sizes_keyboard(ac: float, at: float) -> InlineKeyboardMarkup:
          InlineKeyboardButton("1.2 / 1.5", callback_data="size_1.2_1.5")],
         [InlineKeyboardButton("✏️ Свои значения", callback_data="size_custom")],
     ])
-
-
 def preview_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("✅ Создать DXF + PDF (без подложки)", callback_data="create_plain")],
@@ -521,8 +464,6 @@ def preview_keyboard() -> InlineKeyboardMarkup:
         [InlineKeyboardButton("🔄 Изменить размеры", callback_data="change_sizes")],
         [InlineKeyboardButton("📄 Новый файл (сброс)", callback_data="new_file")],
     ])
-
-
 def memory_keyboard(uid: int) -> InlineKeyboardMarkup:
     mem = load_memory(uid)
     rows = [[InlineKeyboardButton(f"💾 {i}: {mem[i]['name']}", callback_data=f"mem_load_{i}")]
@@ -530,8 +471,6 @@ def memory_keyboard(uid: int) -> InlineKeyboardMarkup:
     rows.append([InlineKeyboardButton("📤 Загрузить новый DXF", callback_data="mem_upload_new")])
     rows.append([InlineKeyboardButton("⬅️ Назад к превью", callback_data="mem_cancel")])
     return InlineKeyboardMarkup(rows)
-
-
 def save_slot_keyboard(uid: int) -> InlineKeyboardMarkup:
     mem = load_memory(uid)
     rows = []
@@ -540,22 +479,16 @@ def save_slot_keyboard(uid: int) -> InlineKeyboardMarkup:
         rows.append([InlineKeyboardButton(label, callback_data=f"slot_{i}")])
     rows.append([InlineKeyboardButton("❌ Не сохранять", callback_data="slot_cancel")])
     return InlineKeyboardMarkup(rows)
-
-
 def done_keyboard(has_underlay: bool) -> InlineKeyboardMarkup:
     rows = []
     if has_underlay:
         rows.append([InlineKeyboardButton("💾 Сохранить подложку в память", callback_data="save_underlay")])
     rows.append([InlineKeyboardButton("📄 Новый файл", callback_data="new_file_confirm")])
     return InlineKeyboardMarkup(rows)
-
-
 def preview_caption(context) -> str:
     return (f"Превью точек: <b>{len(context.user_data['points'])}</b>\n"
             f"Крест: <b>{context.user_data['cross_size']}</b>   Текст: <b>{context.user_data['text_height']}</b>\n\n"
             "Создайте файлы сразу или добавьте DXF-подложку (с проверкой СК).")
-
-
 async def edit_msg(query, text: str, **kw):
     """Фото → меняем подпись, текст → меняем текст."""
     try:
@@ -564,8 +497,6 @@ async def edit_msg(query, text: str, **kw):
         return await query.edit_message_text(text=text, **kw)
     except Exception as e:  # например, «message is not modified»
         logger.debug("edit_msg: %s", e)
-
-
 async def session_ok(update: Update, context) -> bool:
     if "points" in context.user_data:
         return True
@@ -575,12 +506,9 @@ async def session_ok(update: Update, context) -> bool:
     elif update.message:
         await update.message.reply_text("Сессия устарела. Пришлите TXT заново.")
     return False
-
-
 # ═══════════════════════════════════════════════════════════════
 #  Хендлеры: старт, TXT, размеры, превью
 # ═══════════════════════════════════════════════════════════════
-
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     reset_session(context, update.effective_user.id)
     await update.message.reply_text(
@@ -591,8 +519,6 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "   (из памяти — 5 слотов — или новую) с проверкой СК\n\n"
         "/list — готовые файлы, /memory — слоты подложек, /cancel — отмена")
     return ConversationHandler.END
-
-
 async def cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
     files = sorted((user_dir(update.effective_user.id) / "out").glob("*.*"),
                    key=lambda p: p.stat().st_mtime, reverse=True)[:20]
@@ -601,21 +527,15 @@ async def cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     await update.message.reply_text("Последние файлы:\n" + "\n".join(f"• <code>{html.escape(f.name)}</code>" for f in files),
                                     parse_mode=ParseMode.HTML)
-
-
 async def cmd_memory(update: Update, context: ContextTypes.DEFAULT_TYPE):
     mem = load_memory(update.effective_user.id)
     lines = [f"{i}: {html.escape(mem[i]['name'])} ({mem[i].get('saved', '')[:10]})" if i in mem else f"{i}: —"
              for i in range(1, MEMORY_SLOTS + 1)]
     await update.message.reply_text("💾 Память подложек:\n" + "\n".join(lines), parse_mode=ParseMode.HTML)
-
-
 async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     reset_session(context, update.effective_user.id)
     await update.message.reply_text("Отменено. Пришлите новый TXT или /start.")
     return ConversationHandler.END
-
-
 async def handle_txt(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     doc = update.message.document
@@ -628,11 +548,9 @@ async def handle_txt(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not points:
         await msg.edit_text("Не нашёл ни одной точки. Формат: «№ X Y [H]» или «X Y [H]».")
         return ConversationHandler.END
-
     reset_session(context, uid)
     context.user_data["points"] = points
     context.user_data["source_name"] = path.stem
-
     head = "\n".join(f"{p[0]}\t{p[1]:.3f}\t{p[2]:.3f}\t{p[3]:.3f}" for p in points[:8])
     note = f"\n⚠️ Пропущено строк: {skipped}" if skipped else ""
     kb = InlineKeyboardMarkup([[InlineKeyboardButton("✅ Продолжить", callback_data="confirm_yes")],
@@ -641,8 +559,6 @@ async def handle_txt(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"Найдено точек: <b>{len(points)}</b>{note}\n\n<pre>{html.escape(head)}{'…' if len(points) > 8 else ''}</pre>",
         reply_markup=kb, parse_mode=ParseMode.HTML)
     return WAITING_CONFIRM
-
-
 async def handle_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
@@ -655,8 +571,6 @@ async def handle_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ac, at = calculate_auto_sizes(context.user_data["points"])
     await q.edit_message_text("Размер креста / высота текста (м):", reply_markup=sizes_keyboard(ac, at))
     return WAITING_SIZES
-
-
 async def handle_size_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
@@ -676,8 +590,6 @@ async def handle_size_choice(update: Update, context: ContextTypes.DEFAULT_TYPE)
     except Exception:
         pass
     return await send_preview(q.message.chat_id, context)
-
-
 async def handle_custom_size(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await session_ok(update, context):
         return ConversationHandler.END
@@ -688,8 +600,6 @@ async def handle_custom_size(update: Update, context: ContextTypes.DEFAULT_TYPE)
     context.user_data["cross_size"] = round(max(0.15, min(nums[0], 4.0)), 3)
     context.user_data["text_height"] = round(max(0.2, min(nums[1], 5.0)), 3)
     return await send_preview(update.effective_chat.id, context)
-
-
 async def send_preview(chat_id: int, context, underlay: Optional[DxfGeom] = None,
                        caption: Optional[str] = None, kb: Optional[InlineKeyboardMarkup] = None,
                        extra: str = "") -> int:
@@ -703,8 +613,6 @@ async def send_preview(chat_id: int, context, underlay: Optional[DxfGeom] = None
                                      parse_mode=ParseMode.HTML, reply_markup=kb or preview_keyboard())
     png.unlink(missing_ok=True)
     return WAITING_PREVIEW if kb is None else WAITING_CS
-
-
 async def handle_preview(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
@@ -726,20 +634,15 @@ async def handle_preview(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if q.data == "new_file":
         return await ask_new_file(q)
     return WAITING_PREVIEW
-
-
 # ═══════════════════════════════════════════════════════════════
 #  Новый файл
 # ═══════════════════════════════════════════════════════════════
-
 async def ask_new_file(q) -> int:
     await edit_msg(q, "Сбросить текущий набор точек и начать заново?",
                    reply_markup=InlineKeyboardMarkup([
                        [InlineKeyboardButton("✅ Да, новый файл", callback_data="new_file_confirm")],
                        [InlineKeyboardButton("❌ Отмена", callback_data="new_file_cancel")]]))
     return WAITING_NEW_FILE
-
-
 async def handle_new_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
@@ -751,12 +654,9 @@ async def handle_new_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return ConversationHandler.END
     await edit_msg(q, preview_caption(context), reply_markup=preview_keyboard(), parse_mode=ParseMode.HTML)
     return WAITING_PREVIEW
-
-
 # ═══════════════════════════════════════════════════════════════
 #  Подложка: память / загрузка / единицы
 # ═══════════════════════════════════════════════════════════════
-
 async def handle_underlay_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
@@ -783,15 +683,11 @@ async def handle_underlay_choice(update: Update, context: ContextTypes.DEFAULT_T
         await edit_msg(q, f"💾 Подложка из слота {slot}: {html.escape(mem[slot]['name'])}", parse_mode=ParseMode.HTML)
         return await after_underlay_loaded(q.message.chat_id, context)
     return WAITING_UNDERLAY
-
-
 async def handle_dxf_back(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
     await edit_msg(q, "📂 <b>Подложка:</b>", reply_markup=memory_keyboard(q.from_user.id), parse_mode=ParseMode.HTML)
     return WAITING_UNDERLAY
-
-
 async def handle_dxf_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await session_ok(update, context):
         return ConversationHandler.END
@@ -808,8 +704,6 @@ async def handle_dxf_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["unit_code"] = None
     context.user_data["shift"] = (0.0, 0.0)
     return await after_underlay_loaded(update.effective_chat.id, context)
-
-
 async def after_underlay_loaded(chat_id: int, context) -> int:
     path = context.user_data["underlay_path"]
     try:
@@ -830,8 +724,6 @@ async def after_underlay_loaded(chat_id: int, context) -> int:
                                             InlineKeyboardButton("миллиметры", callback_data="unit_mm"),
                                             InlineKeyboardButton("сантиметры", callback_data="unit_cm")]]))
     return WAITING_UNITS
-
-
 async def handle_units(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
@@ -840,12 +732,9 @@ async def handle_units(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["unit_code"] = q.data.split("_", 1)[1]
     await edit_msg(q, f"Единицы подложки: {context.user_data['unit_code']}", reply_markup=None)
     return await run_cs(q.message.chat_id, context)
-
-
 # ═══════════════════════════════════════════════════════════════
 #  Модуль 0 — хендлеры
 # ═══════════════════════════════════════════════════════════════
-
 async def run_cs(chat_id: int, context) -> int:
     wait = await context.bot.send_message(chat_id, "⏳ Считаю геометрию и проверяю СК…")
     shift = tuple(context.user_data.get("shift", (0.0, 0.0)))
@@ -869,8 +758,6 @@ async def run_cs(chat_id: int, context) -> int:
     caption = cs_text(rep, shift, swapped, geom.scale_note)
     return await send_preview(chat_id, context, underlay=geom, caption=caption,
                               kb=cs_keyboard(rep, swapped), extra="с подложкой")
-
-
 async def handle_cs(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
@@ -898,8 +785,6 @@ async def handle_cs(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if d == "new_file":
         return await ask_new_file(q)
     return WAITING_CS
-
-
 async def handle_shift_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await session_ok(update, context):
         return ConversationHandler.END
@@ -909,12 +794,9 @@ async def handle_shift_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return WAITING_SHIFT
     context.user_data["shift"] = (nums[0], nums[1])
     return await run_cs(update.effective_chat.id, context)
-
-
 # ═══════════════════════════════════════════════════════════════
 #  Создание файлов, сохранение подложки в память
 # ═══════════════════════════════════════════════════════════════
-
 async def do_create(chat_id: int, context, q=None) -> int:
     uid = context.user_data["_uid"]
     geom: Optional[DxfGeom] = context.user_data.get("geom")
@@ -943,8 +825,6 @@ async def do_create(chat_id: int, context, q=None) -> int:
         await context.bot.send_message(chat_id, "PDF создать не удалось (см. лог), DXF отправлен.")
     await context.bot.send_message(chat_id, "Что дальше?", reply_markup=done_keyboard(bool(geom)))
     return WAITING_DONE
-
-
 async def handle_done(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
@@ -959,8 +839,6 @@ async def handle_done(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await edit_msg(q, "💾 В какой слот сохранить подложку?", reply_markup=save_slot_keyboard(q.from_user.id))
         return WAITING_SAVE_SLOT
     return WAITING_DONE
-
-
 async def handle_save_slot(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
@@ -986,12 +864,9 @@ async def handle_save_slot(update: Update, context: ContextTypes.DEFAULT_TYPE):
                       f"(единицы: {mem[slot]['units'] or 'из файла'}, сдвиг {mem[slot]['shift']})",
                    parse_mode=ParseMode.HTML, reply_markup=done_keyboard(False))
     return WAITING_DONE
-
-
 # ═══════════════════════════════════════════════════════════════
 #  Сборка приложения
 # ═══════════════════════════════════════════════════════════════
-
 async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
     logger.error("Unhandled error", exc_info=context.error)
     if isinstance(update, Update) and update.effective_chat:
@@ -999,12 +874,9 @@ async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
             await context.bot.send_message(update.effective_chat.id, "⚠️ Что-то пошло не так. Попробуйте ещё раз или /start.")
         except Exception:
             pass
-
-
 def main() -> None:
     app = Application.builder().token(BOT_TOKEN).build()
     txt_filter = filters.Document.FileExtension("txt") | filters.Document.MimeType("text/plain")
-
     conv = ConversationHandler(
         entry_points=[MessageHandler(txt_filter, handle_txt)],
         states={
@@ -1028,7 +900,6 @@ def main() -> None:
         allow_reentry=True,
         name="txt2dxf",
     )
-
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("list", cmd_list))
     app.add_handler(CommandHandler("memory", cmd_memory))
@@ -1036,7 +907,5 @@ def main() -> None:
     app.add_error_handler(on_error)
     logger.info("Bot started (shapely=%s)", HAS_SHAPELY)
     app.run_polling(allowed_updates=Update.ALL_TYPES)
-
-
 if __name__ == "__main__":
     main()
