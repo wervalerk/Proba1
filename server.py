@@ -79,7 +79,6 @@ def load_memory(uid: int) -> Dict[int, dict]:
     try:
         raw = json.loads(p.read_text("utf-8"))
         mem = {int(k): v for k, v in raw.items()}
-        # выкидываем слоты, у которых пропал файл
         return {k: v for k, v in mem.items() if Path(v.get("file", "")).exists()}
     except Exception as e:
         logger.warning("memory.json broken: %s", e)
@@ -90,7 +89,7 @@ def save_memory(uid: int, mem: Dict[int, dict]) -> None:
 def reset_session(context: ContextTypes.DEFAULT_TYPE, uid: int) -> None:
     context.user_data.clear()
     context.user_data["_uid"] = uid
-    context.user_data["swap_xy"] = False
+    context.user_data["swap_xy"] = True          # ← по умолчанию меняем X↔Y (геодезия → AutoCAD)
     context.user_data["shift"] = (0.0, 0.0)
 # ═══════════════════════════════════════════════════════════════
 #  Парсинг TXT
@@ -120,23 +119,17 @@ def parse_points_from_txt(text: str) -> Tuple[List[Point4], int]:
         if not line or line.startswith("#"):
             continue
 
-        # Нормализуем разделители
         s = line.replace("\t", " ").replace(";", ",")
-        # Если есть пробелы — запятую считаем десятичной
         if re.search(r"\s", s):
             s = re.sub(r"(?<=\d),(?=\d)", ".", s)
             parts = s.split()
         else:
-            # Иначе запятая — разделитель полей
             parts = [p.strip() for p in s.split(",") if p.strip() != ""]
 
         if len(parts) < 2:
             skipped += 1
             continue
 
-        # Пробуем понять, есть ли ID в первом поле
-        # Если первое поле — не число, точно ID
-        # Если число и всего ≥ 3 полей — тоже считаем ID
         try:
             first_num = float(parts[0].replace(",", "."))
             has_id = len(parts) >= 3
@@ -156,7 +149,6 @@ def parse_points_from_txt(text: str) -> Tuple[List[Point4], int]:
                 y = float(parts[2].replace(",", "."))
                 z = float(parts[3].replace(",", ".")) if len(parts) > 3 else 0.0
             else:
-                # Без ID: X Y [Z]
                 pid = len(rows) + 1
                 x = float(parts[0].replace(",", "."))
                 y = float(parts[1].replace(",", "."))
@@ -242,7 +234,6 @@ def raw_path(e) -> Optional[dict]:
         pts.append(pts[0])
     return {"pts": pts, "closed": closed, "layer": e.dxf.layer}
 def detect_units(path: Path) -> Tuple[Optional[str], float]:
-    """(override-код если $INSUNITS известен, иначе None; максимальная |координата| для подсказки)."""
     doc = ezdxf.readfile(str(path))
     u = int(doc.header.get("$INSUNITS", 0) or 0)
     code = {4: "mm", 5: "cm", 6: "m"}.get(u)
@@ -313,7 +304,6 @@ def _centroid(pts: List[Tuple[float, float]]) -> Tuple[float, float]:
         return 0.0, 0.0
     return sum(p[0] for p in pts) / len(pts), sum(p[1] for p in pts) / len(pts)
 def check_cs(points: List[Point4], geom: DxfGeom) -> CSReport:
-    """points — уже «эффективные» (с учётом текущего swap). geom — уже со сдвигом."""
     direct = [(x, y) for _, x, y, _ in points]
     swapped = [(y, x) for _, x, y, _ in points]
     d0 = _median_nearest(direct, geom.segments)
@@ -362,19 +352,19 @@ def cs_keyboard(rep: CSReport, swapped: bool) -> InlineKeyboardMarkup:
 # ═══════════════════════════════════════════════════════════════
 def calculate_auto_sizes(points: List[Point4]) -> Tuple[float, float]:
     if len(points) < 2:
-        return 0.7, 0.9
+        return 0.7, 0.45          # текст уменьшен в 2 раза
     xy = sorted((x, y) for _, x, y, _ in points)
     sample = xy[:2000]
     min_d = float("inf")
     for i, (x1, y1) in enumerate(sample):
-        for x2, y2 in sample[i + 1:i + 40]:  # после сортировки по X соседи — рядом
+        for x2, y2 in sample[i + 1:i + 40]:
             d = math.hypot(x1 - x2, y1 - y2)
             if 0.01 < d < min_d:
                 min_d = d
     if not math.isfinite(min_d):
         min_d = 2.0
     cross = max(min(min_d * 0.28, 2.0), 0.35)
-    text = max(min(min_d * 0.38, 2.5), 0.5)
+    text = max(min(min_d * 0.19, 1.25), 0.25)   # было 0.38 / 2.5 / 0.5 → уменьшено в 2 раза
     return round(cross, 2), round(text, 2)
 def create_preview_image(points: List[Point4], cross: float, text_h: float, out: Path,
                          underlay: Optional[DxfGeom] = None, title_extra: str = "") -> None:
@@ -447,10 +437,10 @@ def build_outputs(uid: int, points, cross, text_h, underlay) -> Tuple[Path, Opti
 def sizes_keyboard(ac: float, at: float) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [InlineKeyboardButton(f"🤖 Авто ({ac} / {at})", callback_data="size_auto")],
-        [InlineKeyboardButton("0.4 / 0.6", callback_data="size_0.4_0.6"),
-         InlineKeyboardButton("0.6 / 0.8", callback_data="size_0.6_0.8")],
-        [InlineKeyboardButton("0.8 / 1.0", callback_data="size_0.8_1.0"),
-         InlineKeyboardButton("1.2 / 1.5", callback_data="size_1.2_1.5")],
+        [InlineKeyboardButton("0.4 / 0.3", callback_data="size_0.4_0.3"),
+         InlineKeyboardButton("0.6 / 0.4", callback_data="size_0.6_0.4")],
+        [InlineKeyboardButton("0.8 / 0.5", callback_data="size_0.8_0.5"),
+         InlineKeyboardButton("1.2 / 0.75", callback_data="size_1.2_0.75")],
         [InlineKeyboardButton("✏️ Свои значения", callback_data="size_custom")],
     ])
 def preview_keyboard() -> InlineKeyboardMarkup:
@@ -483,15 +473,15 @@ def done_keyboard(has_underlay: bool) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(rows)
 def preview_caption(context) -> str:
     return (f"Превью точек: <b>{len(context.user_data['points'])}</b>\n"
-            f"Крест: <b>{context.user_data['cross_size']}</b>   Текст: <b>{context.user_data['text_height']}</b>\n\n"
+            f"Крест: <b>{context.user_data['cross_size']}</b>   Текст: <b>{context.user_data['text_height']}</b>\n"
+            f"Ориентация: <b>{'X↔Y переставлены' if context.user_data.get('swap_xy') else 'исходная'}</b>\n\n"
             "Создайте файлы сразу или добавьте DXF-подложку (с проверкой СК).")
 async def edit_msg(query, text: str, **kw):
-    """Фото → меняем подпись, текст → меняем текст."""
     try:
         if query.message.photo:
             return await query.edit_message_caption(caption=text, **kw)
         return await query.edit_message_text(text=text, **kw)
-    except Exception as e:  # например, «message is not modified»
+    except Exception as e:
         logger.debug("edit_msg: %s", e)
 async def session_ok(update: Update, context) -> bool:
     if "points" in context.user_data:
@@ -503,7 +493,7 @@ async def session_ok(update: Update, context) -> bool:
         await update.message.reply_text("Сессия устарела. Пришлите TXT заново.")
     return False
 # ═══════════════════════════════════════════════════════════════
-#  Хендлеры: старт, TXT, размеры, превью
+#  Хендлеры
 # ═══════════════════════════════════════════════════════════════
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     reset_session(context, update.effective_user.id)
@@ -513,6 +503,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "2️⃣ Выберите размер креста и текста → превью\n"
         "3️⃣ Создайте файлы или добавьте DXF-подложку\n"
         "   (из памяти — 5 слотов — или новую) с проверкой СК\n\n"
+        "По умолчанию координаты меняются местами (X↔Y) для соответствия AutoCAD.\n\n"
         "/list — готовые файлы, /memory — слоты подложек, /cancel — отмена")
     return ConversationHandler.END
 async def cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -552,7 +543,9 @@ async def handle_txt(update: Update, context: ContextTypes.DEFAULT_TYPE):
     kb = InlineKeyboardMarkup([[InlineKeyboardButton("✅ Продолжить", callback_data="confirm_yes")],
                                [InlineKeyboardButton("❌ Отмена", callback_data="confirm_no")]])
     await msg.edit_text(
-        f"Найдено точек: <b>{len(points)}</b>{note}\n\n<pre>{html.escape(head)}{'…' if len(points) > 8 else ''}</pre>",
+        f"Найдено точек: <b>{len(points)}</b>{note}\n"
+        f"Ориентация по умолчанию: <b>X↔Y переставлены</b>\n\n"
+        f"<pre>{html.escape(head)}{'…' if len(points) > 8 else ''}</pre>",
         reply_markup=kb, parse_mode=ParseMode.HTML)
     return WAITING_CONFIRM
 async def handle_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -573,7 +566,7 @@ async def handle_size_choice(update: Update, context: ContextTypes.DEFAULT_TYPE)
     if not await session_ok(update, context):
         return ConversationHandler.END
     if q.data == "size_custom":
-        await edit_msg(q, "Напишите два числа — крест и текст, например: 0.55 0.75")
+        await edit_msg(q, "Напишите два числа — крест и текст, например: 0.55 0.35")
         return WAITING_CUSTOM_SIZE
     if q.data == "size_auto":
         cross, th = calculate_auto_sizes(context.user_data["points"])
@@ -591,10 +584,10 @@ async def handle_custom_size(update: Update, context: ContextTypes.DEFAULT_TYPE)
         return ConversationHandler.END
     nums = [float(n) for n in _NUM.findall(update.message.text.replace(",", "."))]
     if len(nums) < 2 or nums[0] <= 0 or nums[1] <= 0:
-        await update.message.reply_text("Нужно два положительных числа, пример: 0.5 0.7")
+        await update.message.reply_text("Нужно два положительных числа, пример: 0.5 0.3")
         return WAITING_CUSTOM_SIZE
     context.user_data["cross_size"] = round(max(0.15, min(nums[0], 4.0)), 3)
-    context.user_data["text_height"] = round(max(0.2, min(nums[1], 5.0)), 3)
+    context.user_data["text_height"] = round(max(0.1, min(nums[1], 2.5)), 3)
     return await send_preview(update.effective_chat.id, context)
 async def send_preview(chat_id: int, context, underlay: Optional[DxfGeom] = None,
                        caption: Optional[str] = None, kb: Optional[InlineKeyboardMarkup] = None,
@@ -630,9 +623,6 @@ async def handle_preview(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if q.data == "new_file":
         return await ask_new_file(q)
     return WAITING_PREVIEW
-# ═══════════════════════════════════════════════════════════════
-#  Новый файл
-# ═══════════════════════════════════════════════════════════════
 async def ask_new_file(q) -> int:
     await edit_msg(q, "Сбросить текущий набор точек и начать заново?",
                    reply_markup=InlineKeyboardMarkup([
@@ -650,9 +640,6 @@ async def handle_new_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return ConversationHandler.END
     await edit_msg(q, preview_caption(context), reply_markup=preview_keyboard(), parse_mode=ParseMode.HTML)
     return WAITING_PREVIEW
-# ═══════════════════════════════════════════════════════════════
-#  Подложка: память / загрузка / единицы
-# ═══════════════════════════════════════════════════════════════
 async def handle_underlay_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
@@ -728,9 +715,6 @@ async def handle_units(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["unit_code"] = q.data.split("_", 1)[1]
     await edit_msg(q, f"Единицы подложки: {context.user_data['unit_code']}", reply_markup=None)
     return await run_cs(q.message.chat_id, context)
-# ═══════════════════════════════════════════════════════════════
-#  Модуль 0 — хендлеры
-# ═══════════════════════════════════════════════════════════════
 async def run_cs(chat_id: int, context) -> int:
     wait = await context.bot.send_message(chat_id, "⏳ Считаю геометрию и проверяю СК…")
     shift = tuple(context.user_data.get("shift", (0.0, 0.0)))
@@ -790,9 +774,6 @@ async def handle_shift_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return WAITING_SHIFT
     context.user_data["shift"] = (nums[0], nums[1])
     return await run_cs(update.effective_chat.id, context)
-# ═══════════════════════════════════════════════════════════════
-#  Создание файлов, сохранение подложки в память
-# ═══════════════════════════════════════════════════════════════
 async def do_create(chat_id: int, context, q=None) -> int:
     uid = context.user_data["_uid"]
     geom: Optional[DxfGeom] = context.user_data.get("geom")
@@ -860,9 +841,6 @@ async def handle_save_slot(update: Update, context: ContextTypes.DEFAULT_TYPE):
                       f"(единицы: {mem[slot]['units'] or 'из файла'}, сдвиг {mem[slot]['shift']})",
                    parse_mode=ParseMode.HTML, reply_markup=done_keyboard(False))
     return WAITING_DONE
-# ═══════════════════════════════════════════════════════════════
-#  Сборка приложения
-# ═══════════════════════════════════════════════════════════════
 async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
     logger.error("Unhandled error", exc_info=context.error)
     if isinstance(update, Update) and update.effective_chat:
