@@ -106,72 +106,68 @@ _NUM = re.compile(r"[-+]?(?:\d+\.?\d*|\.\d+)(?:[eE][-+]?\d+)?")
 def parse_points_from_txt(text: str) -> Tuple[List[Point4], int]:
     """
     Парсит точки из TXT.
-    Поддерживаемые разделители: пробел, таб, запятая, точка с запятой.
-    Десятичный разделитель: точка или запятая.
-    Форматы строк:
-        №  X  Y  [H]
-        X  Y  [H]
+    Поддерживает:
+      - разделители: пробел, таб, запятая, точка с запятой
+      - десятичную точку и запятую
+      - ID как число или строка (A1, P12 и т.п.)
+      - форматы:  ID,X,Y[,Z]   или   X,Y[,Z]
     """
-    rows: List[List[float]] = []
+    rows: List[Tuple[Any, float, float, float]] = []
     skipped = 0
 
-    for line in text.splitlines():
-        line = line.strip()
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
         if not line or line.startswith("#"):
             continue
 
-        # 1. Все «разделители полей» → пробел
-        s = line.replace("\t", " ").replace(";", " ")
-
-        # 2. Если в строке уже есть пробелы — считаем запятую десятичной
-        #    и аккуратно заменяем только «число,число»
+        # Нормализуем разделители
+        s = line.replace("\t", " ").replace(";", ",")
+        # Если есть пробелы — запятую считаем десятичной
         if re.search(r"\s", s):
             s = re.sub(r"(?<=\d),(?=\d)", ".", s)
+            parts = s.split()
         else:
-            # Нет пробелов — запятая почти наверняка разделитель полей
-            s = s.replace(",", " ")
+            # Иначе запятая — разделитель полей
+            parts = [p.strip() for p in s.split(",") if p.strip() != ""]
 
-        # 3. Убираем лишние пробелы и берём токены
-        tokens = s.split()
-        nums = []
-        bad = False
-        for t in tokens:
-            # на всякий случай ещё раз заменим запятую на точку
-            t = t.replace(",", ".")
-            if _NUM.fullmatch(t):
-                nums.append(float(t))
-            else:
-                bad = True
-                break
-
-        if bad or len(nums) < 2:
+        if len(parts) < 2:
             skipped += 1
             continue
-        rows.append(nums)
 
-    if not rows:
-        return [], skipped
+        # Пробуем понять, есть ли ID в первом поле
+        # Если первое поле — не число, точно ID
+        # Если число и всего ≥ 3 полей — тоже считаем ID
+        try:
+            first_num = float(parts[0].replace(",", "."))
+            has_id = len(parts) >= 3
+            id_is_numeric = True
+        except ValueError:
+            has_id = True
+            id_is_numeric = False
+            first_num = None
 
-    # Определяем, является ли первый столбец ID
-    first_is_id = (
-        all(len(r) >= 3 for r in rows)
-        and all(float(r[0]).is_integer() and 0 <= r[0] < 1_000_000 for r in rows)
-        and len({int(r[0]) for r in rows}) == len(rows)
-    )
+        try:
+            if has_id:
+                if id_is_numeric and first_num is not None and float(first_num).is_integer():
+                    pid = int(first_num)
+                else:
+                    pid = parts[0]
+                x = float(parts[1].replace(",", "."))
+                y = float(parts[2].replace(",", "."))
+                z = float(parts[3].replace(",", ".")) if len(parts) > 3 else 0.0
+            else:
+                # Без ID: X Y [Z]
+                pid = len(rows) + 1
+                x = float(parts[0].replace(",", "."))
+                y = float(parts[1].replace(",", "."))
+                z = float(parts[2].replace(",", ".")) if len(parts) > 2 else 0.0
 
-    points: List[Point4] = []
-    for i, r in enumerate(rows, 1):
-        if first_is_id:
-            pid = int(r[0])
-            x, y = r[1], r[2]
-            z = r[3] if len(r) > 3 else 0.0
-        else:
-            pid = i
-            x, y = r[0], r[1]
-            z = r[2] if len(r) > 2 else 0.0
-        points.append((pid, x, y, z))
+            rows.append((pid, x, y, z))
+        except (ValueError, IndexError):
+            skipped += 1
+            continue
 
-    return points, skipped
+    return rows, skipped
 def effective_points(context: ContextTypes.DEFAULT_TYPE) -> List[Point4]:
     """Единственный источник правды: точки с учётом X↔Y — и для проверки, и для превью, и для DXF."""
     pts = context.user_data["points"]
