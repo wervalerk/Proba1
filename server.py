@@ -1,16 +1,15 @@
 #!/usr/bin/env python3
 """
 Telegram-бот: точки из TXT → DXF + PDF.
-Поток:
-  TXT → подтверждение → размеры креста/текста → превью
-      → [создать без подложки] | [подложка: из памяти (5 слотов) / новая]
-      → Модуль 0: проверка СК (X↔Y, X0 Y0) → превью с подложкой
-      → DXF + PDF → [сохранить подложку в слот] | [новый файл]
-Подложка НЕ сохраняется в память автоматически — только по кнопке.
+Поддерживает:
+  - разные разделители в TXT
+  - X↔Y по умолчанию (геодезия → AutoCAD)
+  - подложку DXF + проверку СК
+  - отправку готовых файлов на email и в MAX
 """
 from __future__ import annotations
 import matplotlib
-matplotlib.use("Agg")  # ОБЯЗАТЕЛЬНО до любых импортов pyplot / ezdxf.addons.drawing
+matplotlib.use("Agg")
 import asyncio
 import html
 import json
@@ -19,48 +18,73 @@ import math
 import os
 import re
 import shutil
+import smtplib
 import statistics
 from dataclasses import dataclass
 from datetime import datetime
+from email.message import EmailMessage
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 from uuid import uuid4
+
 import ezdxf
 import matplotlib.pyplot as plt
+import requests
 from ezdxf import bbox, units
 from ezdxf.addons.drawing import matplotlib as ezdxf_mpl
 from ezdxf.path import make_path
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ParseMode
-from telegram.ext import (Application, CallbackQueryHandler, CommandHandler,
-                          ContextTypes, ConversationHandler, MessageHandler,
-                          filters)
+from telegram.ext import (
+    Application, CallbackQueryHandler, CommandHandler,
+    ContextTypes, ConversationHandler, MessageHandler, filters,
+)
+
 try:
     from shapely.geometry import LineString, Point
     from shapely.strtree import STRtree
     HAS_SHAPELY = True
-except Exception:  # pragma: no cover
+except Exception:
     HAS_SHAPELY = False
+
 # ================== НАСТРОЙКИ ==================
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "").strip()
 if not BOT_TOKEN:
     raise SystemExit("Задайте переменную окружения BOT_TOKEN")
+
+# Email (SMTP)
+SMTP_HOST = os.environ.get("SMTP_HOST", "").strip()
+SMTP_PORT = int(os.environ.get("SMTP_PORT", "465"))
+SMTP_USER = os.environ.get("SMTP_USER", "").strip()
+SMTP_PASSWORD = os.environ.get("SMTP_PASSWORD", "").strip()
+SMTP_FROM = os.environ.get("SMTP_FROM", SMTP_USER).strip()
+
+# MAX
+MAX_BOT_TOKEN = os.environ.get("MAX_BOT_TOKEN", "").strip()
+MAX_API = "https://platform-api2.max.ru"
+
 BASE_DIR = Path(__file__).resolve().parent
 WORK_DIR = BASE_DIR / "bot_work"
 WORK_DIR.mkdir(parents=True, exist_ok=True)
+
 MEMORY_SLOTS = 5
-NEAR_M = 5.0        # «рядом»: медиана до ближайшего контура, м
-SWAP_RATIO = 3.0    # во сколько раз X↔Y должна улучшить, чтобы предложить
-MAX_CS_POINTS = 3000  # для медианы хватит выборки
+NEAR_M = 5.0
+SWAP_RATIO = 3.0
+MAX_CS_POINTS = 3000
 # ==============================================
+
 logging.basicConfig(format="%(asctime)s %(name)s %(levelname)s %(message)s", level=logging.INFO)
 logger = logging.getLogger("txt2dxf")
+
 (WAITING_CONFIRM, WAITING_SIZES, WAITING_CUSTOM_SIZE, WAITING_PREVIEW,
  WAITING_UNDERLAY, WAITING_DXF_UPLOAD, WAITING_UNITS, WAITING_CS,
- WAITING_SHIFT, WAITING_NEW_FILE, WAITING_SAVE_SLOT, WAITING_DONE) = range(12)
+ WAITING_SHIFT, WAITING_NEW_FILE, WAITING_SAVE_SLOT, WAITING_DONE,
+ WAITING_EMAIL, WAITING_MAX_ID) = range(14)
+
 Point4 = Tuple[Any, float, float, float]
+
 # ═══════════════════════════════════════════════════════════════
-#  Файлы пользователя и память подложек (на диске → переживает рестарт)
+#  Файлы пользователя и память подложек
 # ═══════════════════════════════════════════════════════════════
 def user_dir(uid: int) -> Path:
     p = WORK_DIR / f"user_{uid}"
@@ -68,10 +92,12 @@ def user_dir(uid: int) -> Path:
     (p / "out").mkdir(parents=True, exist_ok=True)
     (p / "underlays").mkdir(parents=True, exist_ok=True)
     return p
+
 def safe_name(name: str, ext: str) -> str:
     stem = Path(name or "file").stem
     stem = re.sub(r"[^A-Za-z0-9А-Яа-я_.-]+", "_", stem).strip("._") or "file"
     return f"{stem[:60]}{ext}"
+
 def load_memory(uid: int) -> Dict[int, dict]:
     p = user_dir(uid) / "memory.json"
     if not p.exists():
@@ -83,14 +109,17 @@ def load_memory(uid: int) -> Dict[int, dict]:
     except Exception as e:
         logger.warning("memory.json broken: %s", e)
         return {}
+
 def save_memory(uid: int, mem: Dict[int, dict]) -> None:
     p = user_dir(uid) / "memory.json"
     p.write_text(json.dumps({str(k): v for k, v in mem.items()}, ensure_ascii=False, indent=1), "utf-8")
+
 def reset_session(context: ContextTypes.DEFAULT_TYPE, uid: int) -> None:
     context.user_data.clear()
     context.user_data["_uid"] = uid
-    context.user_data["swap_xy"] = True          # ← по умолчанию меняем X↔Y (геодезия → AutoCAD)
+    context.user_data["swap_xy"] = True          # геодезия → AutoCAD
     context.user_data["shift"] = (0.0, 0.0)
+
 # ═══════════════════════════════════════════════════════════════
 #  Парсинг TXT
 # ═══════════════════════════════════════════════════════════════
@@ -101,15 +130,16 @@ def decode_bytes(data: bytes) -> str:
         except UnicodeDecodeError:
             continue
     return data.decode("utf-8", errors="ignore")
+
 _NUM = re.compile(r"[-+]?(?:\d+\.?\d*|\.\d+)(?:[eE][-+]?\d+)?")
+
 def parse_points_from_txt(text: str) -> Tuple[List[Point4], int]:
     """
-    Парсит точки из TXT.
     Поддерживает:
       - разделители: пробел, таб, запятая, точка с запятой
       - десятичную точку и запятую
-      - ID как число или строка (A1, P12 и т.п.)
-      - форматы:  ID,X,Y[,Z]   или   X,Y[,Z]
+      - ID как число или строка (A1, P12…)
+      - форматы: ID,X,Y[,Z]  или  X,Y[,Z]
     """
     rows: List[Tuple[Any, float, float, float]] = []
     skipped = 0
@@ -153,19 +183,19 @@ def parse_points_from_txt(text: str) -> Tuple[List[Point4], int]:
                 x = float(parts[0].replace(",", "."))
                 y = float(parts[1].replace(",", "."))
                 z = float(parts[2].replace(",", ".")) if len(parts) > 2 else 0.0
-
             rows.append((pid, x, y, z))
         except (ValueError, IndexError):
             skipped += 1
             continue
 
     return rows, skipped
+
 def effective_points(context: ContextTypes.DEFAULT_TYPE) -> List[Point4]:
-    """Единственный источник правды: точки с учётом X↔Y — и для проверки, и для превью, и для DXF."""
     pts = context.user_data["points"]
     if context.user_data.get("swap_xy"):
         return [(pid, y, x, z) for pid, x, y, z in pts]
     return pts
+
 # ═══════════════════════════════════════════════════════════════
 #  Геометрия DXF
 # ═══════════════════════════════════════════════════════════════
@@ -174,15 +204,18 @@ class Seg:
     ax: float; ay: float; az: float
     bx: float; by: float; bz: float
     layer: str = "0"
+
 @dataclass
 class DxfGeom:
     polylines: List[Tuple[List[Tuple[float, float, float]], bool, str]]
     segments: List[Seg]
     scale_note: str
     has_z: bool
+
 SUPPORTED = {"LWPOLYLINE", "POLYLINE", "LINE", "ARC", "CIRCLE", "ELLIPSE", "SPLINE"}
 UNIT_TABLE = {1: 0.0254, 2: 0.3048, 4: 0.001, 5: 0.01, 6: 1.0, 7: 1000.0, 10: 0.9144}
 UNIT_OVERRIDE = {"m": 1.0, "cm": 0.01, "mm": 0.001}
+
 def walk(entities, depth: int = 0):
     for e in entities:
         if e.dxftype() == "INSERT" and depth < 3:
@@ -192,6 +225,7 @@ def walk(entities, depth: int = 0):
                 logger.warning("INSERT skipped: %s", ex)
         else:
             yield e
+
 def manual_pts(e):
     t = e.dxftype()
     if t == "LWPOLYLINE":
@@ -212,6 +246,7 @@ def manual_pts(e):
                  c.y + r * math.sin(math.radians(a0 + (a1 - a0) * i / (n - 1))), c.z)
                 for i in range(n)], t == "CIRCLE"
     return [], False
+
 def raw_path(e) -> Optional[dict]:
     if e.dxftype() not in SUPPORTED:
         return None
@@ -233,6 +268,7 @@ def raw_path(e) -> Optional[dict]:
     if closed and math.hypot(pts[-1][0] - pts[0][0], pts[-1][1] - pts[0][1]) > 1e-9:
         pts.append(pts[0])
     return {"pts": pts, "closed": closed, "layer": e.dxf.layer}
+
 def detect_units(path: Path) -> Tuple[Optional[str], float]:
     doc = ezdxf.readfile(str(path))
     u = int(doc.header.get("$INSUNITS", 0) or 0)
@@ -246,11 +282,12 @@ def detect_units(path: Path) -> Tuple[Optional[str], float]:
     except Exception:
         pass
     return code, maxabs
+
 def parse_dxf_geom(path: Path, shift: Tuple[float, float] = (0.0, 0.0), unit_code: Optional[str] = None) -> DxfGeom:
     doc = ezdxf.readfile(str(path))
     raw = [r for r in (raw_path(e) for e in walk(doc.modelspace())) if r]
     if not raw:
-        raise ValueError("В DXF не найдено поддерживаемой геометрии (полилинии, линии, дуги, окружности, сплайны).")
+        raise ValueError("В DXF не найдено поддерживаемой геометрии.")
     if unit_code in UNIT_OVERRIDE:
         scale, note = UNIT_OVERRIDE[unit_code], f"единицы: {unit_code}"
     else:
@@ -270,6 +307,7 @@ def parse_dxf_geom(path: Path, shift: Tuple[float, float] = (0.0, 0.0), unit_cod
         raise ValueError("После приведения единиц не осталось отрезков.")
     has_z = len({round(z, 3) for z in zs}) > 1 or any(abs(z) > 1e-9 for z in zs)
     return DxfGeom(polylines, segments, note, has_z)
+
 # ═══════════════════════════════════════════════════════════════
 #  Модуль 0 — проверка СК
 # ═══════════════════════════════════════════════════════════════
@@ -281,6 +319,7 @@ class CSReport:
     c_dxf: Tuple[float, float]
     ok: bool
     suggest_swap: bool
+
 def _seg_dist(px, py, s: Seg) -> float:
     vx, vy = s.bx - s.ax, s.by - s.ay
     L2 = vx * vx + vy * vy
@@ -288,6 +327,7 @@ def _seg_dist(px, py, s: Seg) -> float:
         return math.hypot(px - s.ax, py - s.ay)
     t = max(0.0, min(1.0, ((px - s.ax) * vx + (py - s.ay) * vy) / L2))
     return math.hypot(px - (s.ax + t * vx), py - (s.ay + t * vy))
+
 def _median_nearest(points: List[Tuple[float, float]], segments: List[Seg]) -> float:
     if not points or not segments:
         return float("inf")
@@ -299,10 +339,12 @@ def _median_nearest(points: List[Tuple[float, float]], segments: List[Seg]) -> f
         tree = STRtree(lines)
         return statistics.median(lines[tree.nearest(Point(x, y))].distance(Point(x, y)) for x, y in points)
     return statistics.median(min(_seg_dist(x, y, s) for s in segments) for x, y in points)
+
 def _centroid(pts: List[Tuple[float, float]]) -> Tuple[float, float]:
     if not pts:
         return 0.0, 0.0
     return sum(p[0] for p in pts) / len(pts), sum(p[1] for p in pts) / len(pts)
+
 def check_cs(points: List[Point4], geom: DxfGeom) -> CSReport:
     direct = [(x, y) for _, x, y, _ in points]
     swapped = [(y, x) for _, x, y, _ in points]
@@ -312,8 +354,10 @@ def check_cs(points: List[Point4], geom: DxfGeom) -> CSReport:
     suggest = (not ok) and d1 < d0 and (d1 <= NEAR_M or d1 * SWAP_RATIO <= d0)
     dxf_pts = [(s.ax, s.ay) for s in geom.segments]
     return CSReport(d0, d1, _centroid(direct), _centroid(dxf_pts), ok, suggest)
+
 def fmt(v: float) -> str:
     return "∞" if not math.isfinite(v) else f"{v:,.1f}".replace(",", " ")
+
 def cs_text(rep: CSReport, shift: Tuple[float, float], swapped: bool, note: str) -> str:
     lines = [
         "🔎 <b>Модуль 0 · проверка системы координат</b>",
@@ -332,11 +376,12 @@ def cs_text(rep: CSReport, shift: Tuple[float, float], swapped: bool, note: str)
     else:
         dx, dy = rep.c_dxf[0] - rep.c_txt[0], rep.c_dxf[1] - rep.c_txt[1]
         lines.append(
-            f"\n⚠️ Точки далеко от контура. Нужен сдвиг подложки X0 Y0 (в метрах, прибавляется к DXF).\n"
-            f"Подсказка по центрам (не применяю автоматически): <code>{-dx:,.3f} {-dy:,.3f}</code>\n"
+            f"\n⚠️ Точки далеко от контура. Нужен сдвиг подложки X0 Y0 (в метрах).\n"
+            f"Подсказка по центрам: <code>{-dx:,.3f} {-dy:,.3f}</code>\n"
             f"Можно просто прислать два числа сообщением."
         )
     return "\n".join(lines)
+
 def cs_keyboard(rep: CSReport, swapped: bool) -> InlineKeyboardMarkup:
     create_label = "✅ Создать DXF + PDF" if rep.ok else "⚠️ Создать как есть"
     return InlineKeyboardMarkup([
@@ -347,12 +392,13 @@ def cs_keyboard(rep: CSReport, swapped: bool) -> InlineKeyboardMarkup:
         [InlineKeyboardButton(create_label, callback_data="cs_create")],
         [InlineKeyboardButton("📄 Новый файл (сброс)", callback_data="new_file")],
     ])
+
 # ═══════════════════════════════════════════════════════════════
 #  Размеры, превью, DXF, PDF
 # ═══════════════════════════════════════════════════════════════
 def calculate_auto_sizes(points: List[Point4]) -> Tuple[float, float]:
     if len(points) < 2:
-        return 0.7, 0.45          # текст уменьшен в 2 раза
+        return 0.7, 0.45
     xy = sorted((x, y) for _, x, y, _ in points)
     sample = xy[:2000]
     min_d = float("inf")
@@ -364,8 +410,9 @@ def calculate_auto_sizes(points: List[Point4]) -> Tuple[float, float]:
     if not math.isfinite(min_d):
         min_d = 2.0
     cross = max(min(min_d * 0.28, 2.0), 0.35)
-    text = max(min(min_d * 0.19, 1.25), 0.25)   # было 0.38 / 2.5 / 0.5 → уменьшено в 2 раза
+    text = max(min(min_d * 0.19, 1.25), 0.25)   # уменьшено в 2 раза
     return round(cross, 2), round(text, 2)
+
 def create_preview_image(points: List[Point4], cross: float, text_h: float, out: Path,
                          underlay: Optional[DxfGeom] = None, title_extra: str = "") -> None:
     fig, ax = plt.subplots(figsize=(11, 8.5), dpi=130)
@@ -387,6 +434,7 @@ def create_preview_image(points: List[Point4], cross: float, text_h: float, out:
     fig.tight_layout()
     fig.savefig(out, dpi=130, bbox_inches="tight", facecolor="white")
     plt.close(fig)
+
 def write_dxf(dxf_path: Path, points: List[Point4], cross: float, text_h: float,
               underlay: Optional[DxfGeom]) -> None:
     doc = ezdxf.new(dxfversion="R2010")
@@ -416,6 +464,7 @@ def write_dxf(dxf_path: Path, points: List[Point4], cross: float, text_h: float,
         ref = msp.add_blockref("POINT_WITH_ID", (x, y, z), dxfattribs={"layer": "POINTS"})
         ref.add_auto_attribs({"ID": str(pid)})
     doc.saveas(str(dxf_path))
+
 def write_pdf(dxf_path: Path, pdf_path: Path) -> bool:
     try:
         doc = ezdxf.readfile(str(dxf_path))
@@ -424,6 +473,7 @@ def write_pdf(dxf_path: Path, pdf_path: Path) -> bool:
     except Exception as e:
         logger.error("PDF error: %s", e)
         return False
+
 def build_outputs(uid: int, points, cross, text_h, underlay) -> Tuple[Path, Optional[Path]]:
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     out = user_dir(uid) / "out"
@@ -431,8 +481,92 @@ def build_outputs(uid: int, points, cross, text_h, underlay) -> Tuple[Path, Opti
     pdf = out / f"points_{stamp}.pdf"
     write_dxf(dxf, points, cross, text_h, underlay)
     return dxf, (pdf if write_pdf(dxf, pdf) else None)
+
 # ═══════════════════════════════════════════════════════════════
-#  Клавиатуры / утилиты
+#  Отправка файлов (Email + MAX)
+# ═══════════════════════════════════════════════════════════════
+def send_email_files(to_email: str, dxf_path: Path, pdf_path: Optional[Path],
+                     subject: str = "Точки DXF + PDF") -> str:
+    if not all([SMTP_HOST, SMTP_USER, SMTP_PASSWORD]):
+        return "SMTP не настроен (SMTP_HOST / SMTP_USER / SMTP_PASSWORD)"
+    try:
+        msg = EmailMessage()
+        msg["Subject"] = subject
+        msg["From"] = SMTP_FROM
+        msg["To"] = to_email
+        msg.set_content("Во вложении файлы точек (DXF и PDF), созданные ботом.")
+
+        with open(dxf_path, "rb") as f:
+            msg.add_attachment(f.read(), maintype="application", subtype="octet-stream",
+                               filename=dxf_path.name)
+        if pdf_path and pdf_path.exists():
+            with open(pdf_path, "rb") as f:
+                msg.add_attachment(f.read(), maintype="application", subtype="pdf",
+                                   filename=pdf_path.name)
+
+        if SMTP_PORT == 465:
+            with smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT) as server:
+                server.login(SMTP_USER, SMTP_PASSWORD)
+                server.send_message(msg)
+        else:
+            with smtplib.SMTP(SMTP_HOST, SMTP_PORT) as server:
+                server.starttls()
+                server.login(SMTP_USER, SMTP_PASSWORD)
+                server.send_message(msg)
+        return "ok"
+    except Exception as e:
+        logger.exception("email send")
+        return str(e)
+
+def send_to_max(user_id: str, dxf_path: Path, pdf_path: Optional[Path]) -> str:
+    if not MAX_BOT_TOKEN:
+        return "MAX_BOT_TOKEN не задан"
+    headers = {"Authorization": MAX_BOT_TOKEN}
+
+    def upload_file(path: Path) -> Optional[str]:
+        r = requests.post(f"{MAX_API}/uploads?type=file", headers=headers, timeout=30)
+        if r.status_code != 200:
+            return None
+        upload_url = r.json().get("url")
+        if not upload_url:
+            return None
+        with open(path, "rb") as f:
+            ur = requests.post(upload_url, headers=headers, files={"data": f}, timeout=120)
+        if ur.status_code not in (200, 201):
+            return None
+        return ur.json().get("token")
+
+    try:
+        tokens = []
+        t1 = upload_file(dxf_path)
+        if t1:
+            tokens.append({"type": "file", "payload": {"token": t1}})
+        if pdf_path and pdf_path.exists():
+            t2 = upload_file(pdf_path)
+            if t2:
+                tokens.append({"type": "file", "payload": {"token": t2}})
+        if not tokens:
+            return "Не удалось загрузить файлы в MAX"
+
+        payload = {
+            "text": f"Файлы точек: {dxf_path.name}" + (f" + {pdf_path.name}" if pdf_path else ""),
+            "attachments": tokens,
+        }
+        r = requests.post(
+            f"{MAX_API}/messages?user_id={user_id}",
+            headers={**headers, "Content-Type": "application/json"},
+            json=payload,
+            timeout=30,
+        )
+        if r.status_code in (200, 201):
+            return "ok"
+        return f"MAX API: {r.status_code} {r.text[:200]}"
+    except Exception as e:
+        logger.exception("max send")
+        return str(e)
+
+# ═══════════════════════════════════════════════════════════════
+#  Клавиатуры
 # ═══════════════════════════════════════════════════════════════
 def sizes_keyboard(ac: float, at: float) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
@@ -443,6 +577,7 @@ def sizes_keyboard(ac: float, at: float) -> InlineKeyboardMarkup:
          InlineKeyboardButton("1.2 / 0.75", callback_data="size_1.2_0.75")],
         [InlineKeyboardButton("✏️ Свои значения", callback_data="size_custom")],
     ])
+
 def preview_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("✅ Создать DXF + PDF (без подложки)", callback_data="create_plain")],
@@ -450,6 +585,7 @@ def preview_keyboard() -> InlineKeyboardMarkup:
         [InlineKeyboardButton("🔄 Изменить размеры", callback_data="change_sizes")],
         [InlineKeyboardButton("📄 Новый файл (сброс)", callback_data="new_file")],
     ])
+
 def memory_keyboard(uid: int) -> InlineKeyboardMarkup:
     mem = load_memory(uid)
     rows = [[InlineKeyboardButton(f"💾 {i}: {mem[i]['name']}", callback_data=f"mem_load_{i}")]
@@ -457,6 +593,7 @@ def memory_keyboard(uid: int) -> InlineKeyboardMarkup:
     rows.append([InlineKeyboardButton("📤 Загрузить новый DXF", callback_data="mem_upload_new")])
     rows.append([InlineKeyboardButton("⬅️ Назад к превью", callback_data="mem_cancel")])
     return InlineKeyboardMarkup(rows)
+
 def save_slot_keyboard(uid: int) -> InlineKeyboardMarkup:
     mem = load_memory(uid)
     rows = []
@@ -465,17 +602,24 @@ def save_slot_keyboard(uid: int) -> InlineKeyboardMarkup:
         rows.append([InlineKeyboardButton(label, callback_data=f"slot_{i}")])
     rows.append([InlineKeyboardButton("❌ Не сохранять", callback_data="slot_cancel")])
     return InlineKeyboardMarkup(rows)
+
 def done_keyboard(has_underlay: bool) -> InlineKeyboardMarkup:
     rows = []
     if has_underlay:
         rows.append([InlineKeyboardButton("💾 Сохранить подложку в память", callback_data="save_underlay")])
+    rows.append([
+        InlineKeyboardButton("📧 На почту", callback_data="send_email"),
+        InlineKeyboardButton("📱 В MAX", callback_data="send_max"),
+    ])
     rows.append([InlineKeyboardButton("📄 Новый файл", callback_data="new_file_confirm")])
     return InlineKeyboardMarkup(rows)
+
 def preview_caption(context) -> str:
     return (f"Превью точек: <b>{len(context.user_data['points'])}</b>\n"
             f"Крест: <b>{context.user_data['cross_size']}</b>   Текст: <b>{context.user_data['text_height']}</b>\n"
             f"Ориентация: <b>{'X↔Y переставлены' if context.user_data.get('swap_xy') else 'исходная'}</b>\n\n"
             "Создайте файлы сразу или добавьте DXF-подложку (с проверкой СК).")
+
 async def edit_msg(query, text: str, **kw):
     try:
         if query.message.photo:
@@ -483,6 +627,7 @@ async def edit_msg(query, text: str, **kw):
         return await query.edit_message_text(text=text, **kw)
     except Exception as e:
         logger.debug("edit_msg: %s", e)
+
 async def session_ok(update: Update, context) -> bool:
     if "points" in context.user_data:
         return True
@@ -492,6 +637,7 @@ async def session_ok(update: Update, context) -> bool:
     elif update.message:
         await update.message.reply_text("Сессия устарела. Пришлите TXT заново.")
     return False
+
 # ═══════════════════════════════════════════════════════════════
 #  Хендлеры
 # ═══════════════════════════════════════════════════════════════
@@ -499,30 +645,35 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     reset_session(context, update.effective_user.id)
     await update.message.reply_text(
         "Привет! Я собираю DXF + PDF из точек в TXT.\n\n"
-        "1️⃣ Пришлите .txt (строки: «№ X Y [H]» или «X Y [H]»)\n"
+        "1️⃣ Пришлите .txt\n"
         "2️⃣ Выберите размер креста и текста → превью\n"
         "3️⃣ Создайте файлы или добавьте DXF-подложку\n"
-        "   (из памяти — 5 слотов — или новую) с проверкой СК\n\n"
-        "По умолчанию координаты меняются местами (X↔Y) для соответствия AutoCAD.\n\n"
+        "4️⃣ После создания можно отправить на почту или в MAX\n\n"
+        "По умолчанию координаты меняются местами (X↔Y).\n\n"
         "/list — готовые файлы, /memory — слоты подложек, /cancel — отмена")
     return ConversationHandler.END
+
 async def cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
     files = sorted((user_dir(update.effective_user.id) / "out").glob("*.*"),
                    key=lambda p: p.stat().st_mtime, reverse=True)[:20]
     if not files:
         await update.message.reply_text("Готовых файлов пока нет.")
         return
-    await update.message.reply_text("Последние файлы:\n" + "\n".join(f"• <code>{html.escape(f.name)}</code>" for f in files),
-                                    parse_mode=ParseMode.HTML)
+    await update.message.reply_text(
+        "Последние файлы:\n" + "\n".join(f"• <code>{html.escape(f.name)}</code>" for f in files),
+        parse_mode=ParseMode.HTML)
+
 async def cmd_memory(update: Update, context: ContextTypes.DEFAULT_TYPE):
     mem = load_memory(update.effective_user.id)
     lines = [f"{i}: {html.escape(mem[i]['name'])} ({mem[i].get('saved', '')[:10]})" if i in mem else f"{i}: —"
              for i in range(1, MEMORY_SLOTS + 1)]
     await update.message.reply_text("💾 Память подложек:\n" + "\n".join(lines), parse_mode=ParseMode.HTML)
+
 async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     reset_session(context, update.effective_user.id)
     await update.message.reply_text("Отменено. Пришлите новый TXT или /start.")
     return ConversationHandler.END
+
 async def handle_txt(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     doc = update.message.document
@@ -533,21 +684,24 @@ async def handle_txt(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = decode_bytes(path.read_bytes())
     points, skipped = parse_points_from_txt(text)
     if not points:
-        await msg.edit_text("Не нашёл ни одной точки. Формат: «№ X Y [H]» или «X Y [H]».")
+        await msg.edit_text("Не нашёл ни одной точки.")
         return ConversationHandler.END
     reset_session(context, uid)
     context.user_data["points"] = points
     context.user_data["source_name"] = path.stem
     head = "\n".join(f"{p[0]}\t{p[1]:.3f}\t{p[2]:.3f}\t{p[3]:.3f}" for p in points[:8])
     note = f"\n⚠️ Пропущено строк: {skipped}" if skipped else ""
-    kb = InlineKeyboardMarkup([[InlineKeyboardButton("✅ Продолжить", callback_data="confirm_yes")],
-                               [InlineKeyboardButton("❌ Отмена", callback_data="confirm_no")]])
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("✅ Продолжить", callback_data="confirm_yes")],
+        [InlineKeyboardButton("❌ Отмена", callback_data="confirm_no")],
+    ])
     await msg.edit_text(
         f"Найдено точек: <b>{len(points)}</b>{note}\n"
         f"Ориентация по умолчанию: <b>X↔Y переставлены</b>\n\n"
         f"<pre>{html.escape(head)}{'…' if len(points) > 8 else ''}</pre>",
         reply_markup=kb, parse_mode=ParseMode.HTML)
     return WAITING_CONFIRM
+
 async def handle_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
@@ -560,6 +714,7 @@ async def handle_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ac, at = calculate_auto_sizes(context.user_data["points"])
     await q.edit_message_text("Размер креста / высота текста (м):", reply_markup=sizes_keyboard(ac, at))
     return WAITING_SIZES
+
 async def handle_size_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
@@ -579,6 +734,7 @@ async def handle_size_choice(update: Update, context: ContextTypes.DEFAULT_TYPE)
     except Exception:
         pass
     return await send_preview(q.message.chat_id, context)
+
 async def handle_custom_size(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await session_ok(update, context):
         return ConversationHandler.END
@@ -589,6 +745,7 @@ async def handle_custom_size(update: Update, context: ContextTypes.DEFAULT_TYPE)
     context.user_data["cross_size"] = round(max(0.15, min(nums[0], 4.0)), 3)
     context.user_data["text_height"] = round(max(0.1, min(nums[1], 2.5)), 3)
     return await send_preview(update.effective_chat.id, context)
+
 async def send_preview(chat_id: int, context, underlay: Optional[DxfGeom] = None,
                        caption: Optional[str] = None, kb: Optional[InlineKeyboardMarkup] = None,
                        extra: str = "") -> int:
@@ -602,6 +759,7 @@ async def send_preview(chat_id: int, context, underlay: Optional[DxfGeom] = None
                                      parse_mode=ParseMode.HTML, reply_markup=kb or preview_keyboard())
     png.unlink(missing_ok=True)
     return WAITING_PREVIEW if kb is None else WAITING_CS
+
 async def handle_preview(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
@@ -623,12 +781,15 @@ async def handle_preview(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if q.data == "new_file":
         return await ask_new_file(q)
     return WAITING_PREVIEW
+
 async def ask_new_file(q) -> int:
     await edit_msg(q, "Сбросить текущий набор точек и начать заново?",
                    reply_markup=InlineKeyboardMarkup([
                        [InlineKeyboardButton("✅ Да, новый файл", callback_data="new_file_confirm")],
-                       [InlineKeyboardButton("❌ Отмена", callback_data="new_file_cancel")]]))
+                       [InlineKeyboardButton("❌ Отмена", callback_data="new_file_cancel")],
+                   ]))
     return WAITING_NEW_FILE
+
 async def handle_new_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
@@ -640,6 +801,7 @@ async def handle_new_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return ConversationHandler.END
     await edit_msg(q, preview_caption(context), reply_markup=preview_keyboard(), parse_mode=ParseMode.HTML)
     return WAITING_PREVIEW
+
 async def handle_underlay_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
@@ -650,8 +812,8 @@ async def handle_underlay_choice(update: Update, context: ContextTypes.DEFAULT_T
         await edit_msg(q, preview_caption(context), reply_markup=preview_keyboard(), parse_mode=ParseMode.HTML)
         return WAITING_PREVIEW
     if q.data == "mem_upload_new":
-        await edit_msg(q, "📤 Пришлите DXF-файл подложки документом.", reply_markup=InlineKeyboardMarkup(
-            [[InlineKeyboardButton("⬅️ Назад", callback_data="mem_back")]]))
+        await edit_msg(q, "📤 Пришлите DXF-файл подложки документом.",
+                       reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Назад", callback_data="mem_back")]]))
         return WAITING_DXF_UPLOAD
     if q.data.startswith("mem_load_"):
         slot = int(q.data.rsplit("_", 1)[1])
@@ -666,11 +828,13 @@ async def handle_underlay_choice(update: Update, context: ContextTypes.DEFAULT_T
         await edit_msg(q, f"💾 Подложка из слота {slot}: {html.escape(mem[slot]['name'])}", parse_mode=ParseMode.HTML)
         return await after_underlay_loaded(q.message.chat_id, context)
     return WAITING_UNDERLAY
+
 async def handle_dxf_back(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
     await edit_msg(q, "📂 <b>Подложка:</b>", reply_markup=memory_keyboard(q.from_user.id), parse_mode=ParseMode.HTML)
     return WAITING_UNDERLAY
+
 async def handle_dxf_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await session_ok(update, context):
         return ConversationHandler.END
@@ -687,13 +851,15 @@ async def handle_dxf_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["unit_code"] = None
     context.user_data["shift"] = (0.0, 0.0)
     return await after_underlay_loaded(update.effective_chat.id, context)
+
 async def after_underlay_loaded(chat_id: int, context) -> int:
     path = context.user_data["underlay_path"]
     try:
         code, maxabs = await asyncio.to_thread(detect_units, path)
     except Exception as e:
         await context.bot.send_message(chat_id, f"❌ Не удалось прочитать DXF: {html.escape(str(e))}",
-                                       parse_mode=ParseMode.HTML, reply_markup=memory_keyboard(context.user_data["_uid"]))
+                                       parse_mode=ParseMode.HTML,
+                                       reply_markup=memory_keyboard(context.user_data["_uid"]))
         return WAITING_UNDERLAY
     if context.user_data.get("unit_code") in UNIT_OVERRIDE or code is not None:
         if context.user_data.get("unit_code") not in UNIT_OVERRIDE:
@@ -701,12 +867,16 @@ async def after_underlay_loaded(chat_id: int, context) -> int:
         return await run_cs(chat_id, context)
     hint = "мм" if maxabs > 1_000_000 else ("м" if maxabs > 1000 else "?")
     await context.bot.send_message(
-        chat_id, f"❓ В DXF не указаны единицы ($INSUNITS=0). Макс. |координата| ≈ {maxabs:,.0f}, похоже на: {hint}.\n"
-                 "В чём нарисована подложка?",
-        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("метры", callback_data="unit_m"),
-                                            InlineKeyboardButton("миллиметры", callback_data="unit_mm"),
-                                            InlineKeyboardButton("сантиметры", callback_data="unit_cm")]]))
+        chat_id,
+        f"❓ В DXF не указаны единицы ($INSUNITS=0). Макс. |координата| ≈ {maxabs:,.0f}, похоже на: {hint}.\n"
+        "В чём нарисована подложка?",
+        reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton("метры", callback_data="unit_m"),
+            InlineKeyboardButton("миллиметры", callback_data="unit_mm"),
+            InlineKeyboardButton("сантиметры", callback_data="unit_cm"),
+        ]]))
     return WAITING_UNITS
+
 async def handle_units(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
@@ -715,6 +885,7 @@ async def handle_units(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["unit_code"] = q.data.split("_", 1)[1]
     await edit_msg(q, f"Единицы подложки: {context.user_data['unit_code']}", reply_markup=None)
     return await run_cs(q.message.chat_id, context)
+
 async def run_cs(chat_id: int, context) -> int:
     wait = await context.bot.send_message(chat_id, "⏳ Считаю геометрию и проверяю СК…")
     shift = tuple(context.user_data.get("shift", (0.0, 0.0)))
@@ -738,6 +909,7 @@ async def run_cs(chat_id: int, context) -> int:
     caption = cs_text(rep, shift, swapped, geom.scale_note)
     return await send_preview(chat_id, context, underlay=geom, caption=caption,
                               kb=cs_keyboard(rep, swapped), extra="с подложкой")
+
 async def handle_cs(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
@@ -753,18 +925,21 @@ async def handle_cs(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await edit_msg(q, "🔁 Перепроверяю…", reply_markup=None)
         return await run_cs(chat, context)
     if d == "cs_shift":
-        await context.bot.send_message(chat, "Введите X0 Y0 (м) — сдвиг, прибавляемый к координатам DXF. "
-                                             "Например: <code>615000 1234000</code> или <code>0 0</code>",
-                                       parse_mode=ParseMode.HTML)
+        await context.bot.send_message(chat,
+            "Введите X0 Y0 (м) — сдвиг, прибавляемый к координатам DXF.\n"
+            "Например: <code>615000 1234000</code> или <code>0 0</code>",
+            parse_mode=ParseMode.HTML)
         return WAITING_SHIFT
     if d == "cs_other":
-        await edit_msg(q, "📂 <b>Подложка:</b>", reply_markup=memory_keyboard(q.from_user.id), parse_mode=ParseMode.HTML)
+        await edit_msg(q, "📂 <b>Подложка:</b>", reply_markup=memory_keyboard(q.from_user.id),
+                       parse_mode=ParseMode.HTML)
         return WAITING_UNDERLAY
     if d == "cs_create":
         return await do_create(chat, context, q)
     if d == "new_file":
         return await ask_new_file(q)
     return WAITING_CS
+
 async def handle_shift_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await session_ok(update, context):
         return ConversationHandler.END
@@ -774,18 +949,25 @@ async def handle_shift_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return WAITING_SHIFT
     context.user_data["shift"] = (nums[0], nums[1])
     return await run_cs(update.effective_chat.id, context)
+
 async def do_create(chat_id: int, context, q=None) -> int:
     uid = context.user_data["_uid"]
     geom: Optional[DxfGeom] = context.user_data.get("geom")
     if q:
         await edit_msg(q, "⏳ Создаю DXF и PDF…", reply_markup=None)
     try:
-        dxf, pdf = await asyncio.to_thread(build_outputs, uid, effective_points(context),
-                                           context.user_data["cross_size"], context.user_data["text_height"], geom)
+        dxf, pdf = await asyncio.to_thread(
+            build_outputs, uid, effective_points(context),
+            context.user_data["cross_size"], context.user_data["text_height"], geom)
     except Exception as e:
         logger.exception("build_outputs")
-        await context.bot.send_message(chat_id, f"❌ Ошибка создания: {html.escape(str(e))}", parse_mode=ParseMode.HTML)
+        await context.bot.send_message(chat_id, f"❌ Ошибка создания: {html.escape(str(e))}",
+                                       parse_mode=ParseMode.HTML)
         return WAITING_PREVIEW
+
+    context.user_data["last_dxf"] = str(dxf)
+    context.user_data["last_pdf"] = str(pdf) if pdf else None
+
     rep: Optional[CSReport] = context.user_data.get("rep")
     warn = ""
     if geom and rep and not rep.ok:
@@ -799,9 +981,10 @@ async def do_create(chat_id: int, context, q=None) -> int:
         with open(pdf, "rb") as f:
             await context.bot.send_document(chat_id, f, filename=pdf.name)
     else:
-        await context.bot.send_message(chat_id, "PDF создать не удалось (см. лог), DXF отправлен.")
+        await context.bot.send_message(chat_id, "PDF создать не удалось, DXF отправлен.")
     await context.bot.send_message(chat_id, "Что дальше?", reply_markup=done_keyboard(bool(geom)))
     return WAITING_DONE
+
 async def handle_done(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
@@ -813,9 +996,23 @@ async def handle_done(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not context.user_data.get("underlay_path"):
             await q.answer("Подложка не использовалась", show_alert=True)
             return WAITING_DONE
-        await edit_msg(q, "💾 В какой слот сохранить подложку?", reply_markup=save_slot_keyboard(q.from_user.id))
+        await edit_msg(q, "💾 В какой слот сохранить подложку?",
+                       reply_markup=save_slot_keyboard(q.from_user.id))
         return WAITING_SAVE_SLOT
+    if q.data == "send_email":
+        await edit_msg(q, "📧 Введите адрес электронной почты, на который отправить DXF + PDF:")
+        return WAITING_EMAIL
+    if q.data == "send_max":
+        if not MAX_BOT_TOKEN:
+            await q.answer("MAX не настроен (нет MAX_BOT_TOKEN)", show_alert=True)
+            return WAITING_DONE
+        await edit_msg(q,
+            "📱 Введите <b>user_id</b> пользователя в MAX (числовой ID):\n\n"
+            "Его можно узнать через API MAX или у ботов-информаторов.",
+            parse_mode=ParseMode.HTML)
+        return WAITING_MAX_ID
     return WAITING_DONE
+
 async def handle_save_slot(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
@@ -837,17 +1034,70 @@ async def handle_save_slot(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "saved": datetime.now().isoformat(timespec="seconds"),
     }
     save_memory(uid, mem)
-    await edit_msg(q, f"💾 Сохранено в слот {slot}: {html.escape(mem[slot]['name'])}\n"
-                      f"(единицы: {mem[slot]['units'] or 'из файла'}, сдвиг {mem[slot]['shift']})",
-                   parse_mode=ParseMode.HTML, reply_markup=done_keyboard(False))
+    await edit_msg(q,
+        f"💾 Сохранено в слот {slot}: {html.escape(mem[slot]['name'])}\n"
+        f"(единицы: {mem[slot]['units'] or 'из файла'}, сдвиг {mem[slot]['shift']})",
+        parse_mode=ParseMode.HTML, reply_markup=done_keyboard(False))
     return WAITING_DONE
+
+async def handle_email(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await session_ok(update, context):
+        return ConversationHandler.END
+    email = update.message.text.strip()
+    if "@" not in email or "." not in email.split("@")[-1]:
+        await update.message.reply_text("Некорректный email. Пример: name@mail.ru")
+        return WAITING_EMAIL
+
+    dxf = Path(context.user_data.get("last_dxf", ""))
+    pdf = Path(context.user_data["last_pdf"]) if context.user_data.get("last_pdf") else None
+    if not dxf.exists():
+        await update.message.reply_text("Файлы уже недоступны. Создайте заново.")
+        return WAITING_DONE
+
+    msg = await update.message.reply_text("⏳ Отправляю на почту…")
+    result = await asyncio.to_thread(send_email_files, email, dxf, pdf)
+    kb = done_keyboard(bool(context.user_data.get("geom")))
+    if result == "ok":
+        await msg.edit_text(f"✅ Отправлено на <b>{html.escape(email)}</b>",
+                            parse_mode=ParseMode.HTML, reply_markup=kb)
+    else:
+        await msg.edit_text(f"❌ Ошибка отправки: {html.escape(result)}",
+                            parse_mode=ParseMode.HTML, reply_markup=kb)
+    return WAITING_DONE
+
+async def handle_max_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await session_ok(update, context):
+        return ConversationHandler.END
+    user_id = update.message.text.strip()
+    if not user_id.isdigit():
+        await update.message.reply_text("user_id должен быть числом. Попробуйте ещё раз.")
+        return WAITING_MAX_ID
+
+    dxf = Path(context.user_data.get("last_dxf", ""))
+    pdf = Path(context.user_data["last_pdf"]) if context.user_data.get("last_pdf") else None
+    if not dxf.exists():
+        await update.message.reply_text("Файлы уже недоступны. Создайте заново.")
+        return WAITING_DONE
+
+    msg = await update.message.reply_text("⏳ Отправляю в MAX…")
+    result = await asyncio.to_thread(send_to_max, user_id, dxf, pdf)
+    kb = done_keyboard(bool(context.user_data.get("geom")))
+    if result == "ok":
+        await msg.edit_text(f"✅ Файлы отправлены в MAX (user_id={user_id})", reply_markup=kb)
+    else:
+        await msg.edit_text(f"❌ Ошибка MAX: {html.escape(result)}",
+                            parse_mode=ParseMode.HTML, reply_markup=kb)
+    return WAITING_DONE
+
 async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
     logger.error("Unhandled error", exc_info=context.error)
     if isinstance(update, Update) and update.effective_chat:
         try:
-            await context.bot.send_message(update.effective_chat.id, "⚠️ Что-то пошло не так. Попробуйте ещё раз или /start.")
+            await context.bot.send_message(update.effective_chat.id,
+                                           "⚠️ Что-то пошло не так. Попробуйте ещё раз или /start.")
         except Exception:
             pass
+
 def main() -> None:
     app = Application.builder().token(BOT_TOKEN).build()
     txt_filter = filters.Document.FileExtension("txt") | filters.Document.MimeType("text/plain")
@@ -858,17 +1108,24 @@ def main() -> None:
             WAITING_SIZES: [CallbackQueryHandler(handle_size_choice, pattern=r"^size_")],
             WAITING_CUSTOM_SIZE: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_custom_size)],
             WAITING_PREVIEW: [CallbackQueryHandler(handle_preview,
-                                                   pattern=r"^(change_sizes|add_underlay|create_plain|new_file)$")],
+                pattern=r"^(change_sizes|add_underlay|create_plain|new_file)$")],
             WAITING_UNDERLAY: [CallbackQueryHandler(handle_underlay_choice, pattern=r"^mem_")],
-            WAITING_DXF_UPLOAD: [MessageHandler(filters.Document.ALL, handle_dxf_upload),
-                                 CallbackQueryHandler(handle_dxf_back, pattern=r"^mem_back$")],
+            WAITING_DXF_UPLOAD: [
+                MessageHandler(filters.Document.ALL, handle_dxf_upload),
+                CallbackQueryHandler(handle_dxf_back, pattern=r"^mem_back$"),
+            ],
             WAITING_UNITS: [CallbackQueryHandler(handle_units, pattern=r"^unit_")],
-            WAITING_CS: [CallbackQueryHandler(handle_cs, pattern=r"^(cs_|new_file$)"),
-                         MessageHandler(filters.TEXT & ~filters.COMMAND, handle_shift_text)],
+            WAITING_CS: [
+                CallbackQueryHandler(handle_cs, pattern=r"^(cs_|new_file$)"),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_shift_text),
+            ],
             WAITING_SHIFT: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_shift_text)],
             WAITING_NEW_FILE: [CallbackQueryHandler(handle_new_file, pattern=r"^new_file_")],
-            WAITING_DONE: [CallbackQueryHandler(handle_done, pattern=r"^(save_underlay|new_file_confirm)$")],
+            WAITING_DONE: [CallbackQueryHandler(handle_done,
+                pattern=r"^(save_underlay|new_file_confirm|send_email|send_max)$")],
             WAITING_SAVE_SLOT: [CallbackQueryHandler(handle_save_slot, pattern=r"^slot_")],
+            WAITING_EMAIL: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_email)],
+            WAITING_MAX_ID: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_max_id)],
         },
         fallbacks=[CommandHandler("cancel", cmd_cancel), CommandHandler("start", cmd_start)],
         allow_reentry=True,
@@ -879,7 +1136,9 @@ def main() -> None:
     app.add_handler(CommandHandler("memory", cmd_memory))
     app.add_handler(conv)
     app.add_error_handler(on_error)
-    logger.info("Bot started (shapely=%s)", HAS_SHAPELY)
+    logger.info("Bot started (shapely=%s, max=%s, smtp=%s)",
+                HAS_SHAPELY, bool(MAX_BOT_TOKEN), bool(SMTP_HOST))
     app.run_polling(allowed_updates=Update.ALL_TYPES)
+
 if __name__ == "__main__":
     main()
